@@ -1,0 +1,998 @@
+#!/usr/bin/env python3
+"""iphone-agent-kit 命令行：安装向导和日常维护。只用 Python 标准库，兼容 macOS 自带的 python3 (3.9)。
+
+    iphone-agent-kit init         安装向导（选助手、配 Bark、写规则、注册后台服务）
+    iphone-agent-kit doctor       体检：每项 ✅/⚠️/❌，并告诉你怎么修
+    iphone-agent-kit resign       重新签名 iPhone 端的 runner（免费 Apple ID 7 天到期）
+    iphone-agent-kit shortcuts    生成「让手机做事」快捷指令到桌面，准备隔空投送
+    iphone-agent-kit status|restart|logs|token
+    iphone-agent-kit uninstall    卸载（不碰 iphone-use 本体）
+
+测试用环境变量：IPHONE_AGENT_KIT_HOME（配置目录）、HOME（改家目录）、
+IPHONE_AGENT_KIT_NO_LAUNCHCTL=1（不真的操作 launchctl）。
+"""
+
+import argparse
+import datetime
+import json
+import os
+import plistlib
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+NAME = "iphone-agent-kit"
+HOME = os.path.expanduser("~")
+KIT_HOME = os.environ.get("IPHONE_AGENT_KIT_HOME", os.path.join(HOME, ".config", NAME))
+CONFIG_PATH = os.path.join(KIT_HOME, "config.json")
+STATE_PATH = os.path.join(KIT_HOME, "state.json")
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+INSTALL_DIR = os.path.join(HOME, ".local", "share", NAME)
+BIN_LINK = os.path.join(HOME, ".local", "bin", NAME)
+LAUNCH_DIR = os.path.join(HOME, "Library", "LaunchAgents")
+LABEL = "com.iphone-agent-kit.bridge"
+DAILY_LABEL = "com.iphone-agent-kit.daily-check"
+IPHONE_USE_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.leeguoo.iphone-use.plist")
+IPHONE_USE_DAEMON = "http://127.0.0.1:44321"
+START = "<!-- iphone-agent-kit:start -->"
+END = "<!-- iphone-agent-kit:end -->"
+RISK_PHRASE = "我接受风险"
+EXTRA_PATH = ["/opt/homebrew/bin", "/usr/local/bin", os.path.join(HOME, ".local", "bin"),
+              os.path.join(HOME, ".iphone-use", "bin")]
+SIGN_DAYS = 7
+
+DRY = False
+ASSUME_YES = False
+
+
+# ---------------------------------------------------------------- 输出和提问
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def ok(msg):
+    say("  ✅ " + msg)
+
+
+def warn(msg, fix=None):
+    say("  ⚠️  " + msg)
+    if fix:
+        say("     怎么办：" + fix)
+
+
+def bad(msg, fix=None):
+    say("  ❌ " + msg)
+    if fix:
+        say("     怎么办：" + fix)
+
+
+def step(title):
+    say("\n" + title)
+
+
+def ask(prompt, default=""):
+    if ASSUME_YES:
+        return default
+    try:
+        ans = input("%s%s：" % (prompt, "（直接回车 = %s）" % default if default else "")).strip()
+    except EOFError:
+        return default
+    return ans or default
+
+
+def confirm(prompt, default=True):
+    if ASSUME_YES:
+        return default
+    ans = ask(prompt + (" [Y/n]" if default else " [y/N]"), "").lower()
+    if not ans:
+        return default
+    return ans in ("y", "yes", "是", "好", "要", "1")
+
+
+# ---------------------------------------------------------------- 文件和命令
+
+def run(cmd, timeout=60, env=None, input_text=None):
+    """跑命令，返回 (退出码, 输出)。找不到程序或超时时退出码为 -1。"""
+    e = dict(os.environ)
+    e["PATH"] = os.pathsep.join(EXTRA_PATH + [e.get("PATH", "")])
+    if env:
+        e.update(env)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=e, input=input_text)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except FileNotFoundError:
+        return -1, "找不到程序 %s" % cmd[0]
+    except subprocess.TimeoutExpired:
+        return -1, "超时（%d 秒）" % timeout
+
+
+def which(name):
+    return shutil.which(name, path=os.pathsep.join(EXTRA_PATH + [os.environ.get("PATH", "")]))
+
+
+def read_text(path, default=""):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return default
+
+
+def write_file(path, content, mode=None):
+    if DRY:
+        say("  [试运行] 会写入 %s" % path)
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def backup(path):
+    """改文件前先备份一份，返回备份路径。"""
+    if not os.path.exists(path):
+        return None
+    dst = "%s.iak-bak-%s" % (path, time.strftime("%Y%m%d%H%M%S"))
+    n = 0
+    while os.path.exists(dst):
+        n += 1
+        dst = "%s.iak-bak-%s-%d" % (path, time.strftime("%Y%m%d%H%M%S"), n)
+    if DRY:
+        say("  [试运行] 会先备份 %s → %s" % (path, dst))
+    else:
+        shutil.copy2(path, dst)
+    return dst
+
+
+def load_json(path, default=None):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {} if default is None else default
+
+
+def system_tz():
+    try:
+        link = os.path.realpath("/etc/localtime")
+        if "zoneinfo/" in link:
+            return link.split("zoneinfo/", 1)[1]
+    except OSError:
+        pass
+    return os.environ.get("TZ") or "UTC"
+
+
+def find_template(name):
+    """配置目录里的同名文件优先，其次仓库 templates/。"""
+    for d in (KIT_HOME, os.path.join(REPO, "templates")):
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    return os.path.join(REPO, "templates", name)
+
+
+def uid():
+    return os.getuid()
+
+
+def launchctl(*args):
+    if os.environ.get("IPHONE_AGENT_KIT_NO_LAUNCHCTL") == "1":
+        say("  （测试模式：跳过 launchctl %s）" % " ".join(args))
+        return 0, ""
+    return run(["launchctl"] + list(args), timeout=30)
+
+
+def service_loaded(label):
+    code, out = launchctl("print", "gui/%d/%s" % (uid(), label))
+    return code == 0, out
+
+
+# ---------------------------------------------------------------- iphone-use
+
+def find_iphone_use():
+    return which("iphone-use")
+
+
+def iphone_use_password():
+    try:
+        with open(IPHONE_USE_PLIST, "rb") as f:
+            return plistlib.load(f).get("EnvironmentVariables", {}).get("IPHONE_USE_PASSWORD")
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+
+
+def run_iphone_use(args, timeout=600):
+    """跑 iphone-use，时区跟系统（iphone-use 校验进程时要求时区一致）。"""
+    exe = find_iphone_use()
+    if not exe:
+        return -1, "找不到 iphone-use（先运行安装脚本，或见 https://github.com/leeguooooo/iphone-use）"
+    return run([exe] + args, timeout=timeout, env={"TZ": system_tz()})
+
+
+def put_app_note(bundle, text):
+    pw = iphone_use_password()
+    if not pw:
+        return False, "读不到 iphone-use 密码（先运行 iphone-use setup）"
+    req = urllib.request.Request(
+        "%s/agent/app-notes?bundle=%s" % (IPHONE_USE_DAEMON, urllib.request.quote(bundle)),
+        data=text.encode("utf-8"), method="PUT",
+        headers={"Authorization": "Bearer " + pw, "X-Phone-Control": "1",
+                 "Content-Type": "text/markdown; charset=utf-8"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return 200 <= r.status < 300, "HTTP %d" % r.status
+    except urllib.error.HTTPError as e:
+        return False, "HTTP %d" % e.code
+    except Exception as e:
+        return False, str(e)
+
+
+# ---------------------------------------------------------------- Xcode 路径（坑 1）
+
+def xcode_dev_dir():
+    code, out = run(["xcode-select", "-p"], timeout=10)
+    return out if code == 0 else ""
+
+
+def xcode_app_of(dev):
+    return dev.split("/Contents/Developer")[0] if "/Contents/Developer" in dev else ""
+
+
+def fix_xcode(quiet=False):
+    """Xcode 路径里有空格时 iphone-use 会失败：在 /Applications 建一个无空格的软链接。返回是否没问题。"""
+    dev = xcode_dev_dir()
+    if not dev:
+        bad("找不到 Xcode（xcode-select -p 没有输出）", "从 App Store 或 developer.apple.com 装好 Xcode，打开一次同意协议")
+        return False
+    if " " not in dev:
+        if not quiet:
+            ok("Xcode 路径没有空格：" + dev)
+        return True
+    app = xcode_app_of(dev)
+    link = "/Applications/Xcode.app"
+    if app and os.path.islink(link) and os.path.realpath(link) == os.path.realpath(app):
+        warn("Xcode 路径有空格（%s），软链接 %s 已存在" % (dev, link),
+             "还需要让系统指向软链接：sudo xcode-select -s %s/Contents/Developer" % link)
+        return False
+    if app and not os.path.exists(link):
+        if DRY:
+            say("  [试运行] 会建软链接 %s → %s" % (link, app))
+            return True
+        try:
+            os.symlink(app, link)
+            ok("已建软链接 %s → %s" % (link, app))
+        except OSError as e:
+            bad("建软链接失败：%s" % e, "手动运行：sudo ln -s '%s' %s" % (app, link))
+            return False
+        warn("还差一步（需要管理员密码，我不替你输）",
+             "sudo xcode-select -s %s/Contents/Developer" % link)
+        return False
+    bad("Xcode 路径有空格（%s），而且 %s 已被占用" % (dev, link),
+        "把 Xcode 放到没有空格的路径，或移走 %s 后重跑 iphone-agent-kit fix-xcode" % link)
+    return False
+
+
+# ---------------------------------------------------------------- 签名日期
+
+def mark_signed(when=None):
+    state = load_json(STATE_PATH)
+    state["runner_signed_at"] = (when or datetime.datetime.now()).isoformat(timespec="seconds")
+    write_file(STATE_PATH, json.dumps(state, ensure_ascii=False, indent=2), 0o600)
+
+
+def sign_days_left():
+    """返回剩余天数（小数）；不知道上次签名时间返回 None。"""
+    s = load_json(STATE_PATH).get("runner_signed_at")
+    if not s:
+        return None
+    try:
+        t = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return SIGN_DAYS - (datetime.datetime.now() - t).total_seconds() / 86400.0
+
+
+# ---------------------------------------------------------------- 规则标记块
+
+def build_rules(persona, takeout, beginner=False):
+    body = read_text(find_template("agent-rules.md"))
+    lines = []
+    for ln in body.splitlines():
+        if ln.startswith(">") or re.match(r"^\s*<!--.*-->\s*$", ln):
+            continue
+        lines.append(ln)
+    text = re.sub(r"\n{3,}", "\n\n", "\n".join(lines).strip()) + "\n"
+    if takeout:
+        text = text.replace("由我自己在手机上付款或确认。", "由我自己在手机上付款或确认。唯一例外是订外卖，见「订外卖要快」。", 1)
+        opt = read_text(find_template(os.path.join("optional", "takeout-direct-pay.md")))
+        mark = "## 规则正文（粘贴这段）"
+        if mark in opt:
+            text += "\n" + opt.split(mark, 1)[1].strip() + "\n"
+    if beginner:
+        text += "\n" + read_text(find_template("beginner-mode.md")).strip() + "\n"
+    if persona:
+        text += ("\n## 推送口吻（小柚）\n\n"
+                 "推送内容用「小柚」的口吻：18 岁台湾女生，像 LINE 聊天，一两句话，只用简体字，"
+                 "带「啦、喔、欸、耶、超」这类语气，偶尔一个颜文字，不要汇报腔。这条只管推送内容，聊天回复照常。\n")
+    return START + "\n" + text.rstrip("\n") + "\n" + END
+
+
+def apply_block(path, block):
+    """把标记块写进文件：已有就只替换标记块，没有就追加到末尾；有改动先备份。返回 True 表示写了。"""
+    old = read_text(path)
+    s, e = old.find(START), old.find(END)
+    if s != -1 and e > s:
+        new = old[:s] + block + old[e + len(END):]
+    else:
+        new = (old.rstrip("\n") + "\n\n" if old.strip() else "") + block + "\n"
+    if new == old:
+        ok("%s 里的规则已是最新" % path)
+        return False
+    bak = backup(path)
+    write_file(path, new)
+    ok("已写入规则：%s%s" % (path, "（原文件备份在 %s）" % bak if bak else ""))
+    return True
+
+
+def remove_block(path):
+    old = read_text(path)
+    s, e = old.find(START), old.find(END)
+    if s == -1 or e < s:
+        return False
+    new = (old[:s].rstrip("\n") + "\n\n" + old[e + len(END):].lstrip("\n")).strip("\n")
+    new = new + "\n" if new else ""
+    backup(path)
+    write_file(path, new)
+    return True
+
+
+AGENT_FILES = {"claude": os.path.join(HOME, ".claude", "CLAUDE.md"),
+               "codex": os.path.join(HOME, ".codex", "AGENTS.md")}
+
+
+# ---------------------------------------------------------------- 桥接服务 / LaunchAgent
+
+def plist_path(label):
+    return os.path.join(LAUNCH_DIR, label + ".plist")
+
+
+def env_for_service():
+    env = {"HOME": HOME,
+           "PATH": ":".join(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
+                             os.path.join(HOME, ".local", "bin")]),
+           "TZ": system_tz(), "LANG": "en_US.UTF-8", "PYTHONUNBUFFERED": "1"}
+    if "IPHONE_AGENT_KIT_HOME" in os.environ:
+        env["IPHONE_AGENT_KIT_HOME"] = KIT_HOME
+    return env
+
+
+def bridge_plist():
+    log = os.path.join(KIT_HOME, "logs", "bridge.log")
+    return {"Label": LABEL,
+            "ProgramArguments": ["/usr/bin/python3", os.path.join(REPO, "bridge", "bridge.py")],
+            "EnvironmentVariables": env_for_service(),
+            "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 10,
+            "StandardOutPath": log, "StandardErrorPath": log}
+
+
+def daily_plist():
+    log = os.path.join(KIT_HOME, "logs", "daily-check.log")
+    return {"Label": DAILY_LABEL,
+            "ProgramArguments": ["/usr/bin/python3", os.path.realpath(__file__), "check-expiry"],
+            "EnvironmentVariables": env_for_service(),
+            "StartCalendarInterval": {"Hour": 10, "Minute": 0},
+            "StandardOutPath": log, "StandardErrorPath": log}
+
+
+def install_service(label, plist):
+    path = plist_path(label)
+    if DRY:
+        say("  [试运行] 会写入 %s 并启动 %s" % (path, label))
+        return True
+    os.makedirs(LAUNCH_DIR, exist_ok=True)
+    os.makedirs(os.path.join(KIT_HOME, "logs"), mode=0o700, exist_ok=True)
+    with open(path, "wb") as f:
+        plistlib.dump(plist, f)
+    launchctl("bootout", "gui/%d/%s" % (uid(), label))
+    code, out = launchctl("bootstrap", "gui/%d" % uid(), path)
+    if code != 0:
+        bad("启动 %s 失败：%s" % (label, out), "看日志：iphone-agent-kit logs")
+        return False
+    ok("已启动后台服务 " + label)
+    return True
+
+
+def remove_service(label):
+    launchctl("bootout", "gui/%d/%s" % (uid(), label))
+    p = plist_path(label)
+    if os.path.exists(p):
+        os.remove(p)
+        ok("已删除 " + p)
+
+
+def bridge_check():
+    """返回 {名字: 路径或 None}。"""
+    code, out = run(["/usr/bin/python3", os.path.join(REPO, "bridge", "bridge.py"), "--check"], timeout=30,
+                    env={"IPHONE_AGENT_KIT_HOME": KIT_HOME})
+    res = {}
+    for ln in out.splitlines():
+        if ": " in ln:
+            k, v = ln.split(": ", 1)
+            res[k.strip()] = None if v.startswith("未找到") else v.strip()
+    return res
+
+
+def http_get(path, token, port, timeout=5):
+    req = urllib.request.Request("http://127.0.0.1:%s%s" % (port, path), headers={"Authorization": "Bearer " + token})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.status, r.read().decode("utf-8", "replace")
+
+
+# ---------------------------------------------------------------- init
+
+def extract_bark_keys(text):
+    keys = []
+    for part in re.split(r"[\s,，;；]+", text.strip()):
+        m = re.search(r"api\.day\.app/([A-Za-z0-9]+)", part)
+        part = m.group(1) if m else part
+        if part and re.fullmatch(r"[A-Za-z0-9]{8,}", part):
+            keys.append(part)
+    return keys
+
+
+def is_desktop_bundled(path):
+    """路径在桌面 App 里面（不是单独装的命令行版）。"""
+    return bool(path) and (".app/Contents/" in path or "/Application Support/" in path)
+
+
+DESKTOP_APPS = {
+    "claude": ["/Applications/Claude.app", "~/Applications/Claude.app"],
+    "codex": ["/Applications/Codex.app", "~/Applications/Codex.app", "/Applications/ChatGPT.app"],
+}
+CLI_NAMES = {"claude": "Claude Code", "codex": "Codex"}
+
+
+def install_cli(name):
+    """帮用户装命令行版。返回 True 表示执行了安装命令（不代表一定成功，调用方要重新探测）。"""
+    if name == "claude":
+        cmd = ["bash", "-c", "curl -fsSL https://claude.ai/install.sh | bash"]
+        shown = "curl -fsSL https://claude.ai/install.sh | bash"
+    elif which("npm"):
+        cmd, shown = ["npm", "install", "-g", "@openai/codex"], "npm install -g @openai/codex"
+    elif which("brew"):
+        cmd, shown = ["brew", "install", "codex"], "brew install codex"
+    else:
+        warn("这台 Mac 上没有 npm 也没有 Homebrew，没法自动装 Codex 命令行版",
+             "打开 https://github.com/openai/codex 照它的安装说明装，装完重跑 iphone-agent-kit init")
+        return False
+    say("  要运行的命令：" + shown)
+    if DRY:
+        say("  [试运行] 不会真的装")
+        return False
+    say("  正在安装，可能要几分钟，请别关窗口……")
+    code, out = run(cmd, timeout=900)
+    if code == 0:
+        ok("%s 命令行版安装命令已执行完" % CLI_NAMES[name])
+        return True
+    warn("安装没成功：%s" % out[-300:], "可以把这段报错发给助手，或看 docs/常见问题.md")
+    return False
+
+
+def check_cli(agents, detected):
+    """方式 B 的后台服务要用助手的命令行版。没有就解释清楚，并（在用户同意后）帮忙装。返回更新后的 detected。"""
+    step_title = "【后台服务需要“命令行版”助手】"
+    say("\n  " + step_title)
+    say("  方式 B 的后台服务是在后台悄悄调用助手的，靠的是它的「命令行版」——")
+    say("  就是能在 Mac 的「终端」App 里运行 claude / codex 命令的那种，和你平时点开的桌面版不是一回事。")
+    redo = False
+    for ag in agents:
+        path = detected.get(ag)
+        label = CLI_NAMES[ag]
+        if path and not is_desktop_bundled(path):
+            ok("%s 命令行版已安装（%s）" % (label, path))
+            continue
+        has_app = any(os.path.exists(os.path.expanduser(p)) for p in DESKTOP_APPS[ag])
+        if has_app or path:
+            warn("检测到你装了 %s 桌面版，但没有单独的命令行版" % label)
+            say("  桌面版里自带了一份，借来用通常也行，但桌面版更新后偶尔会失效。装一份独立的命令行版最稳。")
+        else:
+            warn("这台 Mac 上没找到 %s（桌面版和命令行版都没有）" % label)
+        if confirm("  要我现在帮你安装 %s 命令行版吗？" % label, False):
+            redo = install_cli(ag) or redo
+        else:
+            say("  → 先不装。想装的话，之后重跑 iphone-agent-kit init 就会再问。")
+    if redo:
+        detected = bridge_check()
+        for ag in agents:
+            if detected.get(ag) and not is_desktop_bundled(detected[ag]):
+                ok("%s 命令行版现在可用了：%s" % (CLI_NAMES[ag], detected[ag]))
+            else:
+                warn("装完后还是没探测到 %s 命令行版" % CLI_NAMES[ag], "重新打开一个终端窗口再运行 iphone-agent-kit init")
+    return detected
+
+
+def cmd_init(a):
+    global DRY, ASSUME_YES
+    DRY, ASSUME_YES = a.dry_run, a.yes
+    say("=== iphone-agent-kit 安装向导%s ===" % ("（试运行：不会改任何文件）" if DRY else ""))
+    say("配置目录：" + KIT_HOME)
+    cfg = load_json(CONFIG_PATH)
+    detected = bridge_check() if os.path.exists(os.path.join(REPO, "bridge", "bridge.py")) else {}
+
+    # 1 用哪种方式
+    step("【1/8】你想怎么给手机下命令？（两种可以都要，以后能再改）")
+    say("  A) 助手自己的手机 App：在 Claude / ChatGPT 手机 App 里远程连电脑上的助手。不用快捷指令，不装后台服务。")
+    say("  B) 快捷指令：对 Siri 说一句话，结果用 Bark 推送回来。适合只有命令行的助手。")
+    say("     ⚠️ 选 B 需要后台服务，后台服务要用助手的「命令行版」（在 Mac 的「终端」里运行的 claude / codex）。没有的话下面会帮你装。")
+    mchoice = {"a": "1", "b": "2", "both": "3"}.get(a.mode) or ask("  1) 只要 A  2) 只要 B  3) 两个都要（推荐）。请选", "3")
+    usage = {"1": "a", "2": "b", "3": "both"}.get(mchoice, "both")
+    use_b = usage in ("b", "both")
+    say("")
+    say("  【纯小白模式】开启后，助手每次停下来要你动手（付款、刷脸、点信任、登录……）时，")
+    say("  会用大白话一步一步告诉你「现在要做什么、点哪里、做完怎么办」，推送也一样。")
+    beginner = a.beginner == "on" if a.beginner else confirm("  开启纯小白模式？（第一次用、不懂技术的强烈建议开）", True)
+    say("  → %s" % {"a": "只用方式 A（不装后台服务，不需要快捷指令）", "b": "只用方式 B", "both": "A 和 B 都保留"}[usage])
+
+    # 2 选助手
+    step("【2/8】你用哪个 AI 助手来操控手机？")
+    say("  检测到：Claude Code %s，Codex %s" % (
+        "✅" if detected.get("claude") else "没找到", "✅" if detected.get("codex") else "没找到"))
+    default_choice = "3" if detected.get("claude") and detected.get("codex") else ("2" if detected.get("codex") else "1")
+    choice = {"claude": "1", "codex": "2", "both": "3"}.get(a.agent) or ask(
+        "  1) Claude Code  2) Codex  3) 两个都用。请选", default_choice)
+    agents = {"1": ["claude"], "2": ["codex"], "3": ["claude", "codex"]}.get(choice, ["claude"])
+    default_agent = agents[0]
+    if len(agents) == 2:
+        default_agent = ask("  %s默认用哪个？claude / codex" % ("快捷指令" if use_b else "后台任务"), "claude")
+        default_agent = default_agent if default_agent in ("claude", "codex") else "claude"
+    if "claude" in agents:
+        if not detected.get("claude"):
+            warn("没找到 Claude Code", "先安装 Claude Code")
+        else:
+            code, _ = run([detected["claude"], "auth", "status"], timeout=20)
+            if code == 0:
+                ok("Claude Code 已登录")
+            else:
+                warn("Claude Code 好像还没登录（桥接服务需要它自己登录一次）", "在终端运行：claude auth login")
+    if "codex" in agents and not detected.get("codex"):
+        warn("没找到 Codex", "先安装 Codex 命令行，或之后在 config.json 的 codex.bin 里写路径")
+
+    if use_b:
+        detected = check_cli(agents, detected)
+
+    # 2 Bark
+    step("【3/8】Bark 推送（%s）" % ("必配：快捷指令只回「收到」，做完的结果靠 Bark 推送到手机" if use_b else "方式 A 可选：用来收「要你付款/确认」的提醒"))
+    say("  去 iPhone 的 App Store 搜「Bark」（作者 Finb）安装，打开后首页会显示一个网址，")
+    say("  形如 https://api.day.app/XXXXXXXX/ ，中间那串 XXXXXXXX 就是你的 key。可以把整个网址粘贴过来。")
+    say("  暂时不想配可以留空，以后再运行 init 或直接改 config.json。")
+    keys = extract_bark_keys(a.bark_key) if a.bark_key is not None else extract_bark_keys(
+        ask("  Bark key 或网址（多台手机用空格隔开）", ""))
+    if not keys:
+        keys = (cfg.get("bark") or {}).get("device_keys") or []
+        if keys:
+            ok("沿用已有的 Bark 配置")
+        else:
+            warn("没配 Bark：助手做完事你收不到通知", "之后运行 iphone-agent-kit init 补上")
+
+    # 3 人设
+    step("【4/8】人设「小柚」（18 岁台湾女生口吻，推送更有趣；不喜欢可以关）")
+    persona = a.persona == "on" if a.persona else confirm("  开启小柚人设？", True)
+
+    # 4 外卖直接付款
+    step("【5/8】外卖直接付款（默认关，建议保持关闭）")
+    say("  默认情况下，任何付款（包括外卖）AI 都会停在付款页、推送叫你，由你自己在手机上付。")
+    takeout = False
+    if a.takeout_direct_pay or (not ASSUME_YES and confirm("  要不要了解并开启「外卖直接付款」？", False)):
+        say("")
+        say(read_text(os.path.join(REPO, "templates", "optional", "takeout-direct-pay.md")).split("## 怎么打开")[0].strip())
+        say("")
+        phrase = a.takeout_confirm if a.takeout_confirm is not None else ask(
+            "  看清风险了吗？要开启，请输入「%s」" % RISK_PHRASE, "")
+        takeout = phrase.strip() == RISK_PHRASE
+        say("  → 已开启外卖直接付款" if takeout else "  → 确认词不对，保持关闭")
+
+    # 5 到期提醒
+    step("【6/8】签名到期提醒（免费 Apple ID 签的 iPhone 端程序 7 天过期）")
+    daily = a.daily_check == "on" if a.daily_check else confirm("  每天检查一次，剩 2 天时用 Bark 提醒你？（需要先配好 Bark）", bool(keys))
+
+    # 6 生成配置和文件
+    step("【7/8】生成配置和文件")
+    new_cfg = dict(cfg)
+    if not new_cfg.get("token"):
+        new_cfg["token"] = secrets.token_urlsafe(24)
+    new_cfg["default_agent"] = default_agent
+    new_cfg["persona"] = dict(new_cfg.get("persona") or {}, enabled=persona,
+                              file=(new_cfg.get("persona") or {}).get("file", "persona-xiaoyou.md"))
+    bark = dict(new_cfg.get("bark") or {})
+    bark.setdefault("server", "https://api.day.app")
+    bark.setdefault("group", "iPhone助手")
+    bark["device_keys"] = keys
+    new_cfg["bark"] = bark
+    new_cfg["kit"] = {"beginner": beginner, "usage": usage, "agents": agents, "takeout_direct_pay": takeout, "daily_check": daily}
+    if not DRY:
+        os.makedirs(KIT_HOME, mode=0o700, exist_ok=True)
+        os.chmod(KIT_HOME, 0o700)
+    write_file(CONFIG_PATH, json.dumps(new_cfg, ensure_ascii=False, indent=2), 0o600)
+    ok("配置文件 %s（权限 600，里面有令牌，别发给别人）" % CONFIG_PATH)
+    for name in ("bark_push.py", "stop_runner.sh"):
+        src = os.path.join(REPO, "bridge", name)
+        if DRY:
+            say("  [试运行] 会复制 %s → %s" % (name, KIT_HOME))
+        else:
+            shutil.copy2(src, os.path.join(KIT_HOME, name))
+            os.chmod(os.path.join(KIT_HOME, name), 0o755)
+    ok("已放好推送脚本和关 runner 脚本")
+    prof = os.path.join(KIT_HOME, "profile.md")
+    if os.path.exists(prof):
+        ok("个人档案已存在，不覆盖：" + prof)
+    else:
+        write_file(prof, read_text(os.path.join(REPO, "templates", "profile.md")), 0o600)
+        ok("已建个人档案模板：%s（口味、地址等填在这里，助手做选择时会读）" % prof)
+
+    # 写规则
+    block = build_rules(persona, takeout, beginner)
+    for ag in agents:
+        path = AGENT_FILES[ag]
+        say("\n  接下来要把操作手机的规则写进 %s（只写在「%s」标记块里，其他内容不动，改之前会先备份）。" % (path, "iphone-agent-kit"))
+        if confirm("  可以写吗？", True):
+            apply_block(path, block)
+        else:
+            warn("跳过 %s" % path, "不写的话，直接和 %s 对话时它不知道付款要先确认等规则" % ag)
+
+    # App 笔记
+    notes = sorted(f for f in os.listdir(os.path.join(REPO, "app-notes")) if f.endswith(".md")) \
+        if os.path.isdir(os.path.join(REPO, "app-notes")) else []
+    for f in notes:
+        bundle = f[:-3]
+        if DRY:
+            say("  [试运行] 会把 App 笔记 %s 写入 iphone-use" % bundle)
+            continue
+        good, detail = put_app_note(bundle, read_text(os.path.join(REPO, "app-notes", f)))
+        (ok if good else warn)("App 笔记 %s：%s" % (bundle, "已写入 iphone-use" if good else "没写成（%s），不影响使用" % detail))
+
+    # 7 后台服务
+    step("【8/8】注册后台服务（开机自启，快捷指令发来的任务由它接）")
+    if a.no_launchd:
+        say("  已跳过（--no-launchd）")
+    elif not use_b:
+        say("  只用方式 A，不需要后台服务。")
+        if not DRY and os.path.exists(plist_path(LABEL)):
+            remove_service(LABEL)
+            ok("之前注册过的桥接服务已停掉")
+        if daily:
+            install_service(DAILY_LABEL, daily_plist())
+        elif not DRY and os.path.exists(plist_path(DAILY_LABEL)):
+            remove_service(DAILY_LABEL)
+    else:
+        install_service(LABEL, bridge_plist())
+        if daily:
+            install_service(DAILY_LABEL, daily_plist())
+        else:
+            if not DRY and os.path.exists(plist_path(DAILY_LABEL)):
+                remove_service(DAILY_LABEL)
+    if keys and not DRY and not a.no_push_test:
+        code, out = run(["python3", os.path.join(KIT_HOME, "bark_push.py"), "装好啦，收到这条就说明推送通了～"],
+                        env={"IPHONE_AGENT_KIT_HOME": KIT_HOME}, timeout=30)
+        (ok if code == 0 else warn)("测试推送：%s" % (out or "已发送"), None if code == 0 else "检查 Bark key 和网络")
+
+    say("\n=== 完成%s ===" % "（试运行，什么都没改）" if DRY else "\n=== 完成 ===")
+    say("下一步：")
+    say("  1. iphone-agent-kit doctor      体检一遍")
+    if use_b:
+        say("  2. iphone-agent-kit shortcuts   生成快捷指令，隔空投送到手机（方式 B）")
+    if usage != "b":
+        say("  %s. 方式 A：在助手的手机 App 里远程连电脑，见 docs/方式A-助手手机端.md" % ("3" if use_b else "2"))
+    say("  最后. 编辑 %s 填上你的口味和地址" % prof)
+    return 0
+
+
+# ---------------------------------------------------------------- 其他子命令
+
+def cmd_doctor(a):
+    problems = 0
+
+    def B(msg, fix=None):
+        nonlocal problems
+        problems += 1
+        bad(msg, fix)
+
+    say("=== iphone-agent-kit 体检 ===")
+    step("系统")
+    code, ver = run(["sw_vers", "-productVersion"], timeout=5)
+    ok("macOS %s，%s" % (ver if code == 0 else "?", os.uname().machine))
+    code, pv = run(["python3", "--version"], timeout=10)
+    ok(pv) if code == 0 else B("找不到 python3", "运行 xcode-select --install 装命令行工具")
+    tz = system_tz()
+    ok("系统时区 %s（跑 iphone-use 时会自动带上，避免进程校验失败）" % tz)
+
+    step("Xcode")
+    if not fix_xcode(quiet=False):
+        problems += 1
+
+    step("iphone-use")
+    exe = find_iphone_use()
+    if not exe:
+        B("没装 iphone-use", "重新运行安装脚本，或见 https://github.com/leeguooooo/iphone-use")
+    else:
+        code, v = run_iphone_use(["--version"], timeout=20)
+        ok("%s（%s）" % (v.splitlines()[0] if v and code == 0 else "iphone-use 版本未知", exe))
+        code, out = run_iphone_use(["doctor"], timeout=90)
+        if code == 0:
+            ok("iphone-use doctor 通过")
+        else:
+            clean = re.sub(r"\x1b\[[0-9;]*m", "", out)
+            tail = "\n       ".join(clean.splitlines()[-8:])
+            B("iphone-use doctor 报告了问题：\n       " + tail, "按上面提示处理；手机要插着、解锁、信任这台 Mac")
+
+    step("助手和 MCP")
+    found = bridge_check()
+    cfg = load_json(CONFIG_PATH)
+    agents = (cfg.get("kit") or {}).get("agents") or ["claude", "codex"]
+    for name, label, fix in (("claude", "Claude Code", "安装 Claude Code 并运行 claude auth login"),
+                             ("codex", "Codex", "安装 Codex 命令行"),
+                             ("iphone_use_mcp", "iphone-use-mcp", "运行 iphone-use setup")):
+        if found.get(name):
+            ok("%s：%s" % (label, found[name]))
+        elif name in agents or name == "iphone_use_mcp":
+            B("找不到 %s" % label, fix)
+        else:
+            warn("没找到 %s（你没选它，可忽略）" % label)
+
+    step("桥接服务和配置")
+    if not cfg:
+        B("还没有配置文件 %s" % CONFIG_PATH, "运行 iphone-agent-kit init")
+    else:
+        ok("配置文件存在")
+        mode = os.stat(CONFIG_PATH).st_mode & 0o777
+        ok("权限 %o" % mode) if mode == 0o600 else warn("配置文件权限是 %o，里面有令牌" % mode, "chmod 600 '%s'" % CONFIG_PATH)
+        usage = (cfg.get("kit") or {}).get("usage", "both")
+        loaded, _ = service_loaded(LABEL)
+        if usage == "a":
+            ok("你选的是只用方式 A，不需要后台服务")
+        elif not loaded:
+            B("后台服务没在运行", "iphone-agent-kit restart；还不行就 iphone-agent-kit init")
+        else:
+            try:
+                st, _ = http_get("/health", cfg.get("token", ""), cfg.get("port", 18800))
+                ok("桥接服务正常（端口 %s）" % cfg.get("port", 18800)) if st == 200 else B("桥接服务返回 %s" % st)
+            except Exception as e:
+                B("桥接服务连不上：%s" % e, "iphone-agent-kit logs 看日志，再 iphone-agent-kit restart")
+        keys = (cfg.get("bark") or {}).get("device_keys") or []
+        ok("Bark 已配置（%d 台设备）" % len(keys)) if keys else warn(
+            "还没配 Bark：" + ("要你付款/确认的提醒收不到" if usage == "a" else "快捷指令发的任务结果收不到"), "运行 iphone-agent-kit init 补上 Bark key")
+        for ag in agents:
+            if START in read_text(AGENT_FILES.get(ag, "")):
+                ok("%s 的规则已写入 %s" % (ag, AGENT_FILES[ag]))
+            else:
+                warn("%s 的规则还没写入 %s" % (ag, AGENT_FILES.get(ag)), "运行 iphone-agent-kit init")
+
+    step("签名")
+    left = sign_days_left()
+    if left is None:
+        warn("不知道 iPhone 端程序上次签名的时间", "已重签或刚装好的话运行：iphone-agent-kit resign --mark-now")
+    elif left <= 0:
+        B("签名已过期（%.1f 天前）" % -left, "运行 iphone-agent-kit resign")
+    elif left <= 2:
+        warn("签名还剩 %.1f 天" % left, "尽快运行 iphone-agent-kit resign")
+    else:
+        ok("签名还剩 %.1f 天" % left)
+
+    say("\n共 %d 项需要处理。" % problems if problems else "\n全部正常 🎉")
+    return 1 if problems else 0
+
+
+def cmd_resign(a):
+    if a.mark_now:
+        mark_signed()
+        ok("已记录：现在是签名日期，7 天后到期")
+        return 0
+    if not find_iphone_use():
+        bad("找不到 iphone-use", "先运行安装脚本")
+        return 1
+    say("手机请插着电脑、解锁，并保持亮屏。")
+    code, helptext = run_iphone_use(["--help"], timeout=30)
+    cmd = None
+    for cand in ("resign", "sign", "install-runner"):
+        if re.search(r"(^|\s)%s(\s|$)" % cand, helptext):
+            cmd = cand
+            break
+    if cmd:
+        say("运行 iphone-use %s …" % cmd)
+        code, out = run_iphone_use([cmd], timeout=900)
+    else:
+        say("iphone-use 没有单独的重签命令，用 setup 重装 iPhone 端程序（会重新签名）…")
+        code, out = run_iphone_use(["setup"], timeout=900)
+    say(out[-1500:])
+    if code == 0:
+        mark_signed()
+        ok("完成，已记录签名日期")
+        return 0
+    bad("没成功", "手动步骤：1) 手机插好解锁 2) 终端运行 TZ=%s iphone-use setup 3) 手机上到 设置→通用→VPN与设备管理 信任开发者 4) 成功后运行 iphone-agent-kit resign --mark-now" % system_tz())
+    return 1
+
+
+def cmd_check_expiry(a):
+    left = sign_days_left()
+    if left is None or left > 2:
+        return 0
+    msg = ("签名过期啦，要重签喔，不然手机控不了～" if left <= 0 else
+           "签名只剩 %d 天啰，记得重签喔～" % max(1, int(left + 0.99)))
+    code, out = run(["python3", os.path.join(KIT_HOME, "bark_push.py"), msg], env={"IPHONE_AGENT_KIT_HOME": KIT_HOME})
+    say(out)
+    return code
+
+
+def cmd_shortcuts(a):
+    cfg = load_json(CONFIG_PATH)
+    if not cfg.get("token"):
+        bad("还没有配置/令牌", "先运行 iphone-agent-kit init")
+        return 1
+    if (cfg.get("kit") or {}).get("usage") == "a":
+        warn("你当时选的是「只用方式 A」，后台服务没装，快捷指令发出的任务不会有人接", "要用方式 B：运行 iphone-agent-kit init，选 B 或 都要")
+    out = os.path.expanduser(a.out)
+    cmd = ["/usr/bin/python3", os.path.join(REPO, "bridge", "make_shortcuts.py"), "--out", out]
+    if a.url:
+        cmd += ["--url", a.url]
+    code, text = run(cmd, timeout=180, env={"IPHONE_AGENT_KIT_HOME": KIT_HOME})
+    say(text)
+    if code != 0:
+        return 1
+    ok("快捷指令在 " + out)
+    say("下一步：用隔空投送（AirDrop）把里面的「让手机做事.shortcut」发到你手上要下命令的那台 iPhone，")
+    say("点开导入。⚠️ 这个文件里含你的令牌，只发给自己，不要发给别人。")
+    if not a.no_open:
+        run(["open", out], timeout=10)
+    return 0
+
+
+def cmd_status(a):
+    cfg = load_json(CONFIG_PATH)
+    loaded, out = service_loaded(LABEL)
+    m = re.findall(r"^\s+(state|pid) = (.+)$", out, re.M)
+    say("后台服务：%s %s" % ("运行中" if loaded else "没运行", " ".join("%s=%s" % x for x in m)))
+    if loaded and cfg.get("token"):
+        try:
+            _, body = http_get("/status", cfg["token"], cfg.get("port", 18800))
+            say(body)
+        except Exception as e:
+            say("连不上桥接服务：%s" % e)
+    return 0
+
+
+def cmd_restart(a):
+    code, out = launchctl("kickstart", "-k", "gui/%d/%s" % (uid(), LABEL))
+    if code != 0:
+        bad("重启失败：%s" % out, "没注册过的话运行 iphone-agent-kit init")
+        return 1
+    ok("已重启")
+    return 0
+
+
+def cmd_logs(a):
+    p = os.path.join(KIT_HOME, "logs", "bridge.log")
+    if not os.path.exists(p):
+        say("还没有日志：" + p)
+        return 1
+    os.execvp("tail", ["tail", "-n", "60"] + (["-f"] if a.follow else []) + [p])
+
+
+def cmd_token(a):
+    t = load_json(CONFIG_PATH).get("token")
+    if not t:
+        bad("没有令牌", "先运行 iphone-agent-kit init")
+        return 1
+    say(t)
+    return 0
+
+
+def cmd_fix_xcode(a):
+    return 0 if fix_xcode() else 1
+
+
+def cmd_iu(a):
+    """用系统时区跑 iphone-use：iphone-agent-kit iu setup"""
+    exe = find_iphone_use()
+    if not exe:
+        bad("找不到 iphone-use")
+        return 1
+    env = dict(os.environ, TZ=system_tz(), PATH=os.pathsep.join(EXTRA_PATH + [os.environ.get("PATH", "")]))
+    r = subprocess.run([exe] + a.args, env=env)
+    if r.returncode == 0 and a.args[:1] == ["setup"]:
+        mark_signed()
+    return r.returncode
+
+
+def cmd_uninstall(a):
+    global DRY, ASSUME_YES
+    DRY, ASSUME_YES = a.dry_run, a.yes
+    say("=== 卸载 iphone-agent-kit%s ===" % "（试运行）" if DRY else "=== 卸载 iphone-agent-kit ===")
+    say("不会动 iphone-use 本体和你的手机（要卸载它请看它自己的说明）。")
+    if not a.yes and not confirm("继续吗？", False):
+        return 0
+    remove_service(LABEL)
+    remove_service(DAILY_LABEL)
+    for ag, path in AGENT_FILES.items():
+        if START in read_text(path) and confirm("从 %s 删掉本工具的规则标记块？（先备份，其他内容不动）" % path, True):
+            if remove_block(path):
+                ok("已删除标记块：" + path)
+    if os.path.isdir(KIT_HOME) and confirm("删除配置目录 %s？（含令牌、Bark key、个人档案，删了不能恢复）" % KIT_HOME, False):
+        if DRY:
+            say("  [试运行] 会删除 " + KIT_HOME)
+        else:
+            shutil.rmtree(KIT_HOME)
+            ok("已删除配置目录")
+    if os.path.islink(BIN_LINK):
+        if DRY:
+            say("  [试运行] 会删除 " + BIN_LINK)
+        else:
+            os.remove(BIN_LINK)
+            ok("已删除命令 " + BIN_LINK)
+    if os.path.isdir(os.path.join(INSTALL_DIR, ".git")) and confirm("删除程序文件 %s？" % INSTALL_DIR, True):
+        if DRY:
+            say("  [试运行] 会删除 " + INSTALL_DIR)
+        else:
+            shutil.rmtree(INSTALL_DIR)
+            ok("已删除程序文件")
+    say("\n卸载完成。手机上的快捷指令请自己删掉（里面含令牌）。")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog=NAME, description="iPhone 助手工具包")
+    sub = p.add_subparsers(dest="cmd")
+    s = sub.add_parser("init", help="安装向导")
+    s.add_argument("--dry-run", action="store_true", help="试运行，不改任何文件")
+    s.add_argument("--yes", action="store_true", help="所有提问用默认值（测试/脚本用）")
+    s.add_argument("--mode", choices=["a", "b", "both"], help="用哪种方式：a 助手手机端 / b 快捷指令 / both 都要")
+    s.add_argument("--beginner", choices=["on", "off"], help="纯小白模式：助手停下来时要把怎么操作讲清楚")
+    s.add_argument("--agent", choices=["claude", "codex", "both"])
+    s.add_argument("--bark-key")
+    s.add_argument("--persona", choices=["on", "off"])
+    s.add_argument("--takeout-direct-pay", action="store_true")
+    s.add_argument("--takeout-confirm")
+    s.add_argument("--daily-check", choices=["on", "off"])
+    s.add_argument("--no-launchd", action="store_true")
+    s.add_argument("--no-push-test", action="store_true")
+    s.set_defaults(fn=cmd_init)
+    sub.add_parser("doctor", help="体检").set_defaults(fn=cmd_doctor)
+    s = sub.add_parser("resign", help="重签 iPhone 端 runner")
+    s.add_argument("--mark-now", action="store_true", help="只记录「现在刚签过」，不真的重签")
+    s.set_defaults(fn=cmd_resign)
+    s = sub.add_parser("shortcuts", help="生成快捷指令")
+    s.add_argument("--out", default="~/Desktop/iphone-agent-kit-shortcuts")
+    s.add_argument("--url")
+    s.add_argument("--no-open", action="store_true")
+    s.set_defaults(fn=cmd_shortcuts)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("restart").set_defaults(fn=cmd_restart)
+    s = sub.add_parser("logs")
+    s.add_argument("-f", "--follow", action="store_true")
+    s.set_defaults(fn=cmd_logs)
+    sub.add_parser("token", help="打印令牌").set_defaults(fn=cmd_token)
+    s = sub.add_parser("uninstall", help="卸载")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--yes", action="store_true")
+    s.set_defaults(fn=cmd_uninstall)
+    sub.add_parser("fix-xcode", help="Xcode 路径有空格时建软链接").set_defaults(fn=cmd_fix_xcode)
+    sub.add_parser("check-expiry", help="（内部）检查签名到期并推送").set_defaults(fn=cmd_check_expiry)
+    s = sub.add_parser("iu", help="（内部）用系统时区跑 iphone-use")
+    s.add_argument("args", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_iu)
+    a = p.parse_args()
+    if not a.cmd:
+        p.print_help()
+        return 0
+    return a.fn(a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
