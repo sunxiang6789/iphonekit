@@ -18,7 +18,20 @@ curl -fsSL https://raw.githubusercontent.com/sunxiang6789/sunxiang-ai/main/insta
 
 ### 🤖 更省事：让你电脑上的 AI 助手帮你装
 
-已经有 Claude Code 或 Codex 的话，把下面这段原样发给它，它会自己跑安装、选推荐选项、补装缺的东西；需要你动手的地方（输 Mac 密码、手机上点“信任”等）会一步一步告诉你：
+已经有 Claude Code 或 Codex 的话，打开它，把下面这句发给它就行（它会自己读本页的说明、跑安装、补装缺的东西；需要你动手的地方，比如输 Mac 密码、手机上点“信任”，会一步一步告诉你）：
+
+```
+帮我安装 https://github.com/sunxiang6789/sunxiang-ai ，照它 README 里“让助手帮你装”做。我是小白，需要我动手的地方一步步告诉我。
+```
+
+也可以在终端一行搞定（Codex 把 `claude` 换成 `codex`；**不要加 `-p`**，那是一次性模式，没法中途等你操作）：
+
+```bash
+claude "帮我安装 https://github.com/sunxiang6789/sunxiang-ai ，照它 README 里“让助手帮你装”做。我是小白，需要我动手的地方一步步告诉我。"
+```
+
+<details>
+<summary>助手照着做的详细步骤（助手读这里；你不用看）</summary>
 
 ```
 请帮我安装 iphone-agent-kit（让 AI 操控 iPhone 的工具），我是电脑小白，别问我技术问题，直接处理。
@@ -28,6 +41,8 @@ curl -fsSL https://raw.githubusercontent.com/sunxiang6789/sunxiang-ai/main/insta
 4. 需要我动手的地方（输 Mac 开机密码、iPhone 点“信任”、打开开发者模式、在 Xcode 登录 Apple ID、装 Bark 拿 key），用大白话一步一步告诉我怎么做，做完等我回你。
 5. 全部装完运行 iphone-agent-kit doctor 体检，把结果和下一步告诉我。
 ```
+
+</details>
 
 ## 开始前要准备的
 
