@@ -99,6 +99,7 @@ DEFAULT_CONFIG = {
     # Bark 推送的标题，按任务结果选用；可用 {agent}。
     "push_titles": {
         "done": "iPhone 助手",
+        "ack": "iPhone 助手",
         "needs_confirm": "iPhone 助手 · 等你付款/确认",
         "stopped": "iPhone 助手 · 已停下",
         "failed": "iPhone 助手 · 没办成",
@@ -163,9 +164,9 @@ DEFAULT_CONFIG = {
 
 # 提示语两套：(人设版, 中性版)。人设开关在 config 的 persona.enabled。
 PHRASES = {
-    "ack": ("好喔，我去弄～", "好的，我去办。"),
-    "ack_queued": ("等我一下喔，前面还有{ahead}件事～", "前面还有{ahead}件事，请稍等。"),
-    "ack_think": ("好喔，这个我仔细挑一下～", "好的，这件事我仔细考虑一下。"),
+    "ack": ("老板我这就去看看～", "好的，我去办。"),
+    "ack_queued": ("老板稍等喔，前面还有{ahead}件事～", "前面还有{ahead}件事，请稍等。"),
+    "ack_think": ("老板这个我仔细挑一下～", "好的，这件事我仔细考虑一下。"),
     "stop_done": ("好啦好啦，停下来了～", "已停止。"),
     "stop_done_dropped": ("好啦，停下来了～后面排着的%d件也帮你取消啰", "已停止，后面排队的%d件也取消了。"),
     "stop_dropped": ("排着的%d件帮你取消啰", "排队的%d件已取消。"),
@@ -491,7 +492,17 @@ def release_phone(cfg):
 
 
 def stop_runner(cfg):
-    """关掉 runner（交给人用）。停在付款/确认页时用：页面留着，由你自己在手机上付款或确认。"""
+    """关掉 runner（交给人用，手机不再处于自动化状态）。优先用配置目录里的 stop_runner.sh（已验证的路径）。"""
+    script = os.path.join(DATA_DIR, "stop_runner.sh")
+    if os.path.exists(script):
+        try:
+            r = subprocess.run(["sh", script], capture_output=True, text=True, timeout=90)
+            if '"ok":true' in r.stdout.replace(" ", ""):
+                return True
+            log("关 runner 没成功：%s" % (r.stdout + r.stderr).strip()[-200:])
+        except Exception as e:
+            log("关 runner 出错：%s" % e)
+        return False
     return daemon_call(cfg, "/agent/mode", {"mode": "human"}, "关 runner")
 
 
@@ -611,6 +622,10 @@ class Bridge:
             tpl = self.cfg.get("ack_template") or phrase(self.cfg, "ack")
         ack = tpl.format(agent=AGENT_NAMES[agent], ahead=ahead, id=task["id"], text=text)
         log("收到任务 %s [%s%s] %s" % (task["id"], agent, "/" + mode if mode else "", text))
+        # 快捷指令不出声，「收到」用 Bark 推送告诉用户（放后台线程，不拖慢响应）。
+        if self.cfg.get("ack_by_push", True):
+            threading.Thread(target=bark_push, args=(self.cfg, self.cfg["push_titles"].get("ack", "iPhone 助手"), ack),
+                             daemon=True).start()
         return {"ok": True, "id": task["id"], "agent": agent, "ahead": ahead,
                 "resumed": bool(resume), "ack": ack}
 
@@ -692,7 +707,10 @@ class Bridge:
                 self.finished_cv.notify_all()
             self._notify(task)
             release_phone(self.cfg)
-            if task["state"] == "needs_confirm":
+            with self.lock:
+                idle = not self.queue
+            # 停在付款/确认页，或后面没有排队的任务了：关 runner，免得手机一直处在自动化状态打扰用户。
+            if self.cfg.get("stop_runner_after_task", True) and (task["state"] == "needs_confirm" or idle):
                 stop_runner(self.cfg)
 
     def _prompt(self, task):

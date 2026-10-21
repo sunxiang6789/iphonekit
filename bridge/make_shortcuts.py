@@ -120,10 +120,10 @@ def workflow(actions, color, glyph):
     }
 
 
-def spoken(base, token, path, color, glyph, wait=False, still_working_text="还在做，做完会推送给你。"):
-    """听写 → POST → 朗读「收到」；wait=True 时再等结果并朗读。"""
+def spoken(base, token, path, color, glyph, wait=False, still_working_text="还在做，做完会推送给你。", say=False):
+    """听写 → POST；say=True 才朗读「收到」，wait=True 时再等结果并朗读。默认不出声，「收到」由 Bark 推送。"""
     d, r = _uuid(), _uuid()
-    actions = [dictate(d), request(r, base + path, token, "POST", d), speak(r)]
+    actions = [dictate(d), request(r, base + path, token, "POST", d)] + ([speak(r)] if say else [])
     if wait:
         actions += wait_and_speak(base, token, still_working_text)
     return workflow(actions, color, glyph)
@@ -189,7 +189,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     print("服务地址：" + base)
 
-    # 只生成一个快捷指令：听写 → 发给桥接服务 → 朗读「收到」。不等结果、不朗读结果，结果用 Bark 推送。
+    # 只生成一个快捷指令：听写 → 发给桥接服务。不出声、不等结果：「收到」和结果都用 Bark 推送。
     # 叫停靠说话：说「停止」「别弄了」服务会直接停。
     # 其余几个（等结果版、回复助手、手机状态、停止助手、手机朗读）的生成函数保留在上面，需要时再加回这里。
     items = {
