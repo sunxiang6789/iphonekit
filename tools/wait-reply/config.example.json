@@ -1,0 +1,12 @@
+{
+  "me_names": ["你在群里被 @ 时用的群昵称"],
+  "ai_prefix": "【AI助手】",
+  "timezone": "Asia/Shanghai",
+  "judge": {
+    "base_url": "https://api.deepseek.com",
+    "model": "deepseek-chat",
+    "key_env": "DEEPSEEK_API_KEY",
+    "key_file": "",
+    "push_style": "口语化的一句话"
+  }
+}

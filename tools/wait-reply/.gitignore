@@ -1,0 +1,11 @@
+# 运行时数据：含真实聊天内容，只在本机
+watch.log
+queue.jsonl
+tasks.json
+state.json
+config.json
+*.out
+*.log
+*.bak-*
+NotifWatch.app/
+notif-watch
