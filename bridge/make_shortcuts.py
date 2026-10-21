@@ -123,7 +123,9 @@ def workflow(actions, color, glyph):
 def spoken(base, token, path, color, glyph, wait=False, still_working_text="还在做，做完会推送给你。", say=False):
     """听写 → POST；say=True 才朗读「收到」，wait=True 时再等结果并朗读。默认不出声，「收到」由 Bark 推送。"""
     d, r = _uuid(), _uuid()
-    actions = [dictate(d), request(r, base + path, token, "POST", d)] + ([speak(r)] if say else [])
+    # 第一步先「叫醒」桥接服务：用户还在说话的时候，它就在后台把手机准备好（说完话就不用再等十几秒）。
+    actions = [request(_uuid(), base + "/wake", token, "GET"), dictate(d),
+               request(r, base + path, token, "POST", d)] + ([speak(r)] if say else [])
     if wait:
         actions += wait_and_speak(base, token, still_working_text)
     return workflow(actions, color, glyph)

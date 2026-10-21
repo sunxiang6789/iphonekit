@@ -491,19 +491,60 @@ def release_phone(cfg):
     return daemon_call(cfg, "/agent/owner", {"release": True}, "交还手机")
 
 
+RUNNER_MARK = os.path.join(DATA_DIR, "runner_stopped_by_bridge")
+
+
 def stop_runner(cfg):
-    """关掉 runner（交给人用，手机不再处于自动化状态）。优先用配置目录里的 stop_runner.sh（已验证的路径）。"""
+    """关掉 runner（交给人用，手机不再处于自动化状态）。优先用配置目录里的 stop_runner.sh（已验证的路径）。
+    成功后留一个标记文件：说明这次是桥接自己关的，下个任务开始前可以放心地重新接管；用户自己手动关的没有标记，不去抢。"""
     script = os.path.join(DATA_DIR, "stop_runner.sh")
     if os.path.exists(script):
         try:
             r = subprocess.run(["sh", script], capture_output=True, text=True, timeout=90)
             if '"ok":true' in r.stdout.replace(" ", ""):
+                try:
+                    open(RUNNER_MARK, "w").close()
+                except OSError:
+                    pass
                 return True
             log("关 runner 没成功：%s" % (r.stdout + r.stderr).strip()[-200:])
         except Exception as e:
             log("关 runner 出错：%s" % e)
         return False
     return daemon_call(cfg, "/agent/mode", {"mode": "human"}, "关 runner")
+
+
+def iphone_use_ready(cfg):
+    """iphone-use status：手机可以被控制时退出码为 0。"""
+    exe = shutil.which("iphone-use") or os.path.expanduser("~/.local/bin/iphone-use")
+    env = dict(os.environ)
+    env.update(cfg.get("env", {}))
+    try:
+        return subprocess.run([exe, "status"], capture_output=True, env=env, timeout=20).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def resume_runner(cfg):
+    """上个任务结束时桥接自己关了 runner，这次任务开始前把它重新打开并等到可用（最多 90 秒）。
+    没有标记文件（比如用户自己手动关的）就什么都不做，不去抢手机。"""
+    if not os.path.exists(RUNNER_MARK):
+        return False
+    t0 = time.time()
+    if not daemon_call(cfg, "/agent/mode", {"mode": "agent"}, "重新接管手机"):
+        log("重新接管手机没成功，交给助手自己重连")
+        return False
+    try:
+        os.remove(RUNNER_MARK)
+    except OSError:
+        pass
+    while time.time() - t0 < 90:
+        if iphone_use_ready(cfg):
+            log("手机已就绪（重新接管用了 %.0f 秒）" % (time.time() - t0))
+            return True
+        time.sleep(3)
+    log("等了 90 秒手机还没就绪，交给助手自己重连")
+    return True
 
 
 def phone_speak(cfg, text):
@@ -527,6 +568,9 @@ class Bridge:
         self.lock = threading.Lock()
         self.wake = threading.Condition(self.lock)
         self.finished_cv = threading.Condition(self.lock)
+        self.resume_lock = threading.Lock()  # 叫醒和任务开始前的接管不能同时进行
+        self.warm_until = 0.0  # 叫醒后在这个时间点之前不重复叫醒
+        self.last_task_at = 0.0
         self.stop_acked = {}  # 来源地址 → 刚用语音叫停的时间，免得等结果的快捷指令再念一遍
         self.queue = deque()
         self.current = None
@@ -534,6 +578,29 @@ class Bridge:
         self.tasks = self._load_tasks()
         os.makedirs(WORK_DIR, exist_ok=True)
         threading.Thread(target=self._worker, daemon=True).start()
+
+    def warm_up(self):
+        """快捷指令一开始（用户还在说话）就叫醒：提前把桥接自己关掉的 runner 重新接管好，说完话就能直接开工。
+        用户自己手动关的（没有标记文件）不会动。叫醒后 90 秒内没有任务来（用户取消了），就再把 runner 关掉。"""
+        now = time.time()
+        with self.lock:
+            if self.current or self.queue or now < self.warm_until:
+                return {"ok": True, "warming": False}
+            self.warm_until = now + 90
+        threading.Thread(target=self._warm_worker, args=(now,), daemon=True).start()
+        return {"ok": True, "warming": True}
+
+    def _warm_worker(self, woke_at):
+        with self.resume_lock:
+            resumed = resume_runner(self.cfg)
+        if not resumed:
+            return
+        time.sleep(max(0.0, woke_at + 90 - time.time()))
+        with self.lock:
+            used = self.last_task_at >= woke_at or self.current or self.queue
+        if not used:
+            log("叫醒后 90 秒没有任务，重新关掉 runner")
+            stop_runner(self.cfg)
 
     def _load_tasks(self):
         try:
@@ -621,6 +688,7 @@ class Bridge:
         else:
             tpl = self.cfg.get("ack_template") or phrase(self.cfg, "ack")
         ack = tpl.format(agent=AGENT_NAMES[agent], ahead=ahead, id=task["id"], text=text)
+        self.last_task_at = time.time()
         log("收到任务 %s [%s%s] %s" % (task["id"], agent, "/" + mode if mode else "", text))
         # 快捷指令不出声，「收到」用 Bark 推送告诉用户（放后台线程，不拖慢响应）。
         if self.cfg.get("ack_by_push", True):
@@ -784,8 +852,14 @@ class Bridge:
         cmd = self._command(task, out_file)
         env = dict(os.environ)
         env.update(self.cfg.get("env", {}))
+        if self.cfg.get("stop_runner_after_task", True):
+            with self.resume_lock:
+                resume_runner(self.cfg)
         if task["agent"] == "claude" and not self.cfg["claude"].get("tool_search", False):
             env["ENABLE_TOOL_SEARCH"] = "false"
+        if task["agent"] == "claude":
+            # 不读用户自己的 ~/.claude/CLAUDE.md：里面直接对话用的规则（关 runner、推送、不抢手机……）会和桥接的规则打架。
+            env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
         log("开始任务 %s：%s%s" % (task["id"], task["agent"], "（接着上次对话）" if task["resume"] else ""))
         proc = subprocess.Popen(cmd, cwd=WORK_DIR, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1023,6 +1097,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, self.bridge.wait_latest(self.client_address[0], secs))
         if url.path == "/health":
             return self._send(200, {"ok": True})
+        if url.path == "/wake":
+            return self._send(200, self.bridge.warm_up())
         self._send(404, {"ok": False, "error": "没有这个接口"})
 
     def do_POST(self):
@@ -1048,6 +1124,8 @@ class Handler(BaseHTTPRequestHandler):
                     client=client, speak=body.get("speak")))
             if path == "/stop":
                 return self._send(200, self.bridge.stop())
+            if path == "/wake":
+                return self._send(200, self.bridge.warm_up())
         except ValueError as e:
             return self._send(400, {"ok": False, "error": str(e), "ack": str(e)})
         self._send(404, {"ok": False, "error": "没有这个接口"})
