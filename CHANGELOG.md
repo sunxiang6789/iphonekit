@@ -3,6 +3,11 @@
 版本号遵循 `主.次.修`：新功能加“次”，修 bug 加“修”。每个版本在 [Releases](https://github.com/sunxiang6789/sunxiang-ai/releases) 页都有对应说明。
 查看自己装的版本：`iphone-agent-kit --version`。更新：重新运行安装命令即可。
 
+## 0.1.1 · 2026-10-21 · 文档：模型与速度实测
+
+- 新增 [docs/模型与速度.md](docs/模型与速度.md)：各命令行的启动速度（dsh 1.2～2.4 秒、Claude 约 6 秒、Codex 约 8.5 秒）、真实手机任务耗时、回复语生成速度。
+- README 新增“⭐ 推荐使用（重点看）”：推荐 dsh + 水星 3 干活、DeepSeek flash 写回复，并给出备用顺序和配置。
+
 ## 0.1.0 · 2026-10-21 · 首个公开版本
 
 **装起来**

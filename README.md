@@ -147,6 +147,57 @@ iphone-agent-kit doctor
 - 之后在指令开头说「用 DeepSeek，……」（或「用 dsh，……」）就走它。
 - 命令行版依赖官方的 MCP 插件 `@deepseek-ai/dsh-mcp-client`，向导会自动装；`dsh` 目前是候选版本（0.2.x），更新后如果不好用，重跑 `iphone-agent-kit init`。
 
+## ⭐ 推荐使用（重点看）
+
+我们实测了各个助手、模型的速度，**推荐用 DeepSeek Harness（`dsh`）+ 水星 3 干活，DeepSeek flash 写“收到”**。完整数据和说明见 [docs/模型与速度.md](docs/模型与速度.md)。
+
+**命令行启动速度（⭐ 每个任务都要付的固定开销）**
+
+| 助手（命令行） | 启动耗时（中位数） |
+|---|---|
+| **dsh（DeepSeek Harness）** ⭐ | **1.2～2.4 秒** |
+| claude（Claude Code） | 约 6 秒 |
+| codex（Codex） | 约 8.5 秒 |
+
+**真实手机任务耗时（让它查手机还剩多少空间）**
+
+| 模型 | 耗时 |
+|---|---|
+| **水星 3（dsh）** ⭐ | **约 26 秒**（热启动 13 秒） |
+| Claude Sonnet 5.5 · medium | 约 41 秒 |
+| Codex gpt-6.1-sol · low | 约 45 秒 |
+| DeepSeek flash（dsh） | 约 53 秒 |
+
+多步任务（看天气并记到备忘录）：水星 3 用了 40 秒，DeepSeek flash 用了 47.6 秒。
+
+**推荐配置**
+
+```json
+{
+  "default_agent": "dsh",
+  "task": {
+    "model": "inception/mercury-3",
+    "fallbacks": [
+      {"agent": "dsh", "model": "deepseek-official/deepseek-flash"},
+      {"agent": "codex"},
+      {"agent": "claude", "model": "claude-sonnet-5-5"}
+    ]
+  },
+  "ack": {
+    "chain": [
+      {"agent": "dsh", "profile": "iak-ack", "model": "deepseek-official/deepseek-flash", "effort": "off"},
+      {"agent": "claude", "model": "claude-haiku-5-5"}
+    ]
+  }
+}
+```
+
+- **干活**：dsh + 水星 3（最快）。
+- **备用**：先换 DeepSeek flash（不同服务商，一家没额度另一家还能用），再换 Codex、Claude。
+- **“收到”回复**：DeepSeek flash，档位 off，约 1.2 秒。
+- ⚠️ 水星 3 **不支持**档位 `off`，用水星时 `effort` 留空。
+- ⚠️ 这些是 2026-10-21 在 iPhone 17 Pro 上的小样本实测，只比相对快慢；换了手机、网络、模型版本，结果会变。dsh 需要你有 DeepSeek（或水星）的 API key。
+
 ## 自己选模型、设备用模型
 
 在 `~/.config/iphone-agent-kit/config.json` 里改，改完运行 `iphone-agent-kit restart`。完整例子见 [config.example.json](config.example.json)。
