@@ -643,7 +643,9 @@ def cmd_init(a):
     for ag in agents:
         path = AGENT_FILES[ag]
         say("\n  接下来要把操作手机的规则写进 %s（只写在「%s」标记块里，其他内容不动，改之前会先备份）。" % (path, "iphone-agent-kit"))
-        if confirm("  可以写吗？", True):
+        if a.no_rules:
+            say("  已跳过（--no-rules）")
+        elif confirm("  可以写吗？", True):
             apply_block(path, block)
         else:
             warn("跳过 %s" % path, "不写的话，直接和 %s 对话时它不知道付款要先确认等规则" % ag)
@@ -682,7 +684,10 @@ def cmd_init(a):
     if keys and not DRY and not a.no_push_test:
         code, out = run(["python3", os.path.join(KIT_HOME, "bark_push.py"), "装好啦，收到这条就说明推送通了～"],
                         env={"IPHONE_AGENT_KIT_HOME": KIT_HOME}, timeout=30)
-        (ok if code == 0 else warn)("测试推送：%s" % (out or "已发送"), None if code == 0 else "检查 Bark key 和网络")
+        if code == 0:
+            ok("测试推送：%s" % (out or "已发送"))
+        else:
+            warn("测试推送：%s" % out, "检查 Bark key 和网络")
 
     say("\n=== 完成%s ===" % "（试运行，什么都没改）" if DRY else "\n=== 完成 ===")
     say("下一步：")
@@ -961,6 +966,7 @@ def main():
     s.add_argument("--takeout-confirm")
     s.add_argument("--daily-check", choices=["on", "off"])
     s.add_argument("--no-launchd", action="store_true")
+    s.add_argument("--no-rules", action="store_true", help="不写规则标记块")
     s.add_argument("--no-push-test", action="store_true")
     s.set_defaults(fn=cmd_init)
     sub.add_parser("doctor", help="体检").set_defaults(fn=cmd_doctor)
