@@ -75,5 +75,12 @@
     "bin": "",
     "profile": "iak",
     "ack_profile": "iak-ack"
+  },
+  "experience": {
+    "enabled": true,
+    "max_chars": 1500,
+    "review_enabled": true,
+    "review_timeout_secs": 45,
+    "review_chain": []
   }
 }

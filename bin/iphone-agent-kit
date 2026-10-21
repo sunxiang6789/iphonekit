@@ -950,6 +950,34 @@ def cmd_token(a):
     return 0
 
 
+def cmd_experience(a):
+    """本机经验的统一入口；不启动手机、桥接服务或模型。"""
+    sys.path.insert(0, os.path.join(REPO, "bridge"))
+    from assistant_context import ContextStore
+    exp = load_json(CONFIG_PATH).get("experience") or {}
+    store = ContextStore(KIT_HOME, exp.get("max_chars", 1500))
+    snapshot = store.preload()
+    if a.write:
+        if not os.path.isfile(os.path.expanduser(a.write)):
+            bad("找不到要写入的经验文档")
+            return 1
+        try:
+            snapshot = store.write_summary(read_text(os.path.expanduser(a.write)),
+                                           a.revision or snapshot["revision"])
+        except ValueError as e:
+            bad(str(e))
+            return 1
+    if a.json:
+        # 不顺带输出个人档案，避免查看经验时误分享个人信息。
+        say(json.dumps({k: snapshot[k] for k in ("summary", "revision", "oversized")}, ensure_ascii=False))
+    else:
+        say(snapshot["summary"] or "经验库还是空的；任务完成后会在后台积累。")
+        say("\n版本：%s；上限：%d 字" % (snapshot["revision"], store.max_chars))
+        if snapshot["oversized"]:
+            warn("文档超过上限，暂不注入任务，请先压缩后写回。")
+    return 0
+
+
 def cmd_fix_xcode(a):
     return 0 if fix_xcode() else 1
 
@@ -1041,6 +1069,11 @@ def main():
     s.add_argument("-f", "--follow", action="store_true")
     s.set_defaults(fn=cmd_logs)
     sub.add_parser("token", help="打印令牌").set_defaults(fn=cmd_token)
+    s = sub.add_parser("experience", help="查看/纠正所有助手共用的本机精简经验")
+    s.add_argument("--write", metavar="FILE", help="用 UTF-8 文档更新精简经验")
+    s.add_argument("--revision", help="只在当前经验版本匹配时更新，避免覆盖其他助手的修改")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_experience)
     s = sub.add_parser("uninstall", help="卸载")
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--yes", action="store_true")
