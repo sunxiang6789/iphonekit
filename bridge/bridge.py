@@ -431,6 +431,40 @@ ACK_PROMPT_PERSONA = (
     "你是小柚，18 岁台湾女生，称呼用户“老板”。用户刚用语音发来一条指令，你先用一句话回应：表示收到、马上去办。"
     "要求：必须和指令内容相关（点出要做什么），不超过 20 个字，像 LINE 聊天，带「啦、喔、欸」这类语气，"
     "只能用简体字，绝对不能出现繁体字（例如“幫”要写“帮”，“鬧鐘”要写“闹钟”，“設定”要写“设定”），不要引号、不要解释、不要承诺结果，只输出这一句话。\n用户指令：")
+QUICK_PROMPT_PERSONA = (
+    "你是小柚，18 岁台湾女生，称呼用户“老板”。用户刚用语音发来一句话。先判断它是不是“不用手机、不用联网、不依赖之前聊天内容、你有把握一次答准”的简单问题"
+    "（报时/报日期、算数、常识、翻译短句、打招呼闲聊）。\n"
+    "是：输出『直答：』加答案，答案不超过 60 个字，像 LINE 聊天，带「啦、喔、欸」语气。报时报日期只能用下面给的系统时间，系统时间就是用户这里的时间。\n"
+    "不是（要操作手机、查天气/新闻/价格等实时信息、提到“刚才/这个/那个/上面”、拿不准）：输出『收到：』加一句回应，表示收到、马上去办，"
+    "点出要做什么，不超过 20 个字，不要承诺结果。\n"
+    "全程只用简体字（“幫”写“帮”），不要引号、不要解释，只输出这一行。\n系统时间：%s\n用户指令：")
+QUICK_WORDS = re.compile(r"手机|打开|开启|关闭|app|应用|备忘|微信|短信|发给|发送|截图|屏幕|页面|点击|点开|订|买|付|设置|闹钟|提醒|拍|拨|"
+                         r"查看|相册|照片|天气|刚才|上面|这个|那个|它|继续|解锁|整理|总结|保存|写|记|删|搜|小红书|抖音|淘宝|美团|外卖|"
+                         r"导航|地图|新闻|股价|价格|汇率", re.I)
+
+
+class QuickGate:
+    """让 worker 稍等一下「收到」小模型：它如果能直接答，就不再跑后面的任务模型。"""
+    def __init__(self):
+        self.event, self.lock = threading.Event(), threading.Lock()
+        self.answer, self.closed = None, False
+
+
+def now_text(cfg):
+    tz = cfg.get("env", {}).get("TZ") or system_tz()
+    try:
+        now = datetime.datetime.now(ZoneInfo(tz))
+    except (ValueError, KeyError):
+        tz, now = "UTC", datetime.datetime.now(datetime.timezone.utc)
+    return "%s（时区 %s）" % (now.strftime("%Y-%m-%d %H:%M 星期%w").replace("星期0", "星期日"), tz)
+
+
+def quick_eligible(cfg, text, queued, base):
+    return bool((cfg.get("ack") or {}).get("quick_answer", True) and cfg.get("ack_mode", "llm") == "llm"
+                and cfg.get("ack_by_push", True) and not queued and len(text) <= 40
+                and not QUICK_WORDS.search(text) and (not base or base.get("state") == "done"))
+
+
 ACK_PROMPT_PLAIN = (
     "用户刚用语音发来一条指令，你先用一句话回应：表示收到、马上去办。"
     "要求：必须和指令内容相关（点出要做什么），不超过 20 个字，语气自然礼貌，"
@@ -529,10 +563,13 @@ def _ack_via_codex(cfg, entry, prompt, env, timeout):
 ACK_RUNNERS = {"dsh": _ack_via_dsh, "claude": _ack_via_claude, "codex": _ack_via_codex}
 
 
-def generate_ack(cfg, text):
+def generate_ack(cfg, text, quick=False):
     """现编一句和指令相关的「收到」：按 ack.chain 的顺序试，前一个出错/没额度就换下一个；都不行返回 None，由固定的话兜底。"""
     persona = (cfg.get("persona") or {}).get("enabled", True)
-    prompt = (ACK_PROMPT_PERSONA if persona else ACK_PROMPT_PLAIN) + text[:300]
+    if quick:
+        prompt = QUICK_PROMPT_PERSONA % now_text(cfg) + text[:300]
+    else:
+        prompt = (ACK_PROMPT_PERSONA if persona else ACK_PROMPT_PLAIN) + text[:300]
     env = dict(os.environ); env.update(cfg.get("env", {}))
     timeout = float(cfg.get("ack_timeout_secs", 10))
     for entry in (cfg.get("ack") or {}).get("chain") or []:
@@ -543,6 +580,14 @@ def generate_ack(cfg, text):
         try:
             lines = fn(cfg, entry, prompt, env, timeout).strip().splitlines()
             line = to_simplified((lines[0] if lines else "").strip().strip("\"“”'「」"))
+            if quick:
+                m = re.match(r"^(直答|收到)[：:]\s*(.+)$", line)
+                if m:
+                    line = ("直答：" if m.group(1) == "直答" else "") + m.group(2).strip().strip("\"“”'「」")
+                    if 2 <= len(line) <= (130 if m.group(1) == "直答" else 40):
+                        return line
+                    log("回复语（%s）输出不像样，换下一个" % entry.get("agent"))
+                    continue
             if 2 <= len(line) <= 40:
                 return line
             log("回复语（%s）输出不像样，换下一个" % entry.get("agent"))
@@ -689,6 +734,15 @@ def iphone_use_ready(cfg):
         return False
 
 
+def client_key(addr):
+    """同一部手机走 Wi-Fi、USB（169.254.x）、Tailscale 时来源地址不同，但是同一个人；本机测试单独算。"""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return addr
+    return "local" if ip.is_loopback else "phone"
+
+
 def phone_state(cfg):
     """只读状态；JSON 格式不可用时返回空，不猜锁屏或占用状态。"""
     exe = shutil.which("iphone-use") or os.path.expanduser("~/.local/bin/iphone-use")
@@ -702,7 +756,21 @@ def phone_state(cfg):
         return {}
 
 
-def resume_runner(cfg):
+UNLOCK_NO = re.compile(r"还没|没(有)?(解锁|允许|好|开|弄)|未(解锁|允许|完成)|不(要|用|行|能|可以|继续|是)|先不|先别|"
+                       r"别(继续|动|做|试|操作|急|弄)|等(一下|等|会)|暂时|稍后|待会|[吗嘛呢?？]$")
+UNLOCK_YES = re.compile(r"(已经?|刚)(解锁|解开|允许|授权|打开)|(解锁|解开|允许|授权)(了|好了|完)|"
+                        r"可以(继续|了|操作|开始)|继续吧?$|好了|好啦|搞定|没问题|^ok$|^好$|^行$|^可以$", re.I)
+
+
+def is_unlock_ack(text):
+    """用户对“请解锁手机”的回复是不是明确的肯定。拿不准一律算没解锁（更保守，只会多问一次）。"""
+    t = re.sub(r"[\s，。,.!！~～、]+", "", text or "")
+    if not t or len(t) > 30 or UNLOCK_NO.search(t):
+        return False
+    return bool(UNLOCK_YES.search(t))
+
+
+def resume_runner(cfg, allow_passcode_retry=False):
     """上个任务结束时桥接自己关了 runner，这次任务开始前把它重新打开并等到可用（最多 90 秒）。
     没有标记文件（比如用户自己手动关的）就什么都不做，不去抢手机。"""
     # /wake 在线程中、MCP 在另一个进程中；共同的文件锁避免并发接管。
@@ -712,7 +780,7 @@ def resume_runner(cfg):
         if not os.path.exists(RUNNER_MARK):
             return False
         state = phone_state(cfg)
-        if state.get("locked") or state.get("setup_blocked_on") == "needs_passcode_on_phone":
+        if state.get("locked") or (state.get("setup_blocked_on") == "needs_passcode_on_phone" and not allow_passcode_retry):
             log("手机需要本人解锁，不等待 90 秒")
             return False
         if state.get("owner") and state["owner"] != phone_owner(cfg):
@@ -723,7 +791,7 @@ def resume_runner(cfg):
         atomic_text(RUNNER_STARTED, str(time.time()))
         while time.time() - t0 < 90:
             state = phone_state(cfg)
-            if state.get("locked") or state.get("setup_blocked_on") == "needs_passcode_on_phone":
+            if state.get("locked") or (state.get("setup_blocked_on") == "needs_passcode_on_phone" and not allow_passcode_retry):
                 return False
             if state.get("human_handoff") or state.get("mode") == "human":
                 # 人手动停止过；清掉自动接管标记，之后不能重抢。
@@ -823,13 +891,25 @@ class Bridge:
         threading.Thread(target=self._review_worker, daemon=True).start()
         threading.Thread(target=self._worker, daemon=True).start()
 
-    def _push_ack(self, text, fallback, queued):
-        """推「收到」。默认让小模型按指令内容现编一句（排队时仍用固定的话，因为要说前面还有几件）；失败就用固定的话。"""
+    def _push_ack(self, text, fallback, queued, gate=None):
+        """推「收到」。默认让小模型按指令内容现编一句（排队时仍用固定的话，因为要说前面还有几件）；失败就用固定的话。
+        有 gate 时小模型还会判断能不能直接答：能答就交给 worker 当结果推送，不再推「收到」。"""
         msg = None
         if self.cfg.get("ack_mode", "llm") == "llm" and not queued:
             t0 = time.time()
-            msg = generate_ack(self.cfg, text)
+            try:
+                msg = generate_ack(self.cfg, text, quick=gate is not None)
+            finally:
+                if gate is not None and not (msg or "").startswith("直答："):
+                    gate.event.set()  # 不是直答（或失败）：放行任务模型
             log("回复语：%s（%.1f 秒）" % (msg or "生成失败，用固定的话", time.time() - t0))
+        if gate is not None and (msg or "").startswith("直答："):
+            with gate.lock:
+                if not gate.closed:
+                    gate.answer = msg[len("直答："):]
+                    gate.event.set()
+                    return
+            msg = None  # worker 已经等不及开工了，补一句普通的收到
         bark_push(self.cfg, self.cfg["push_titles"].get("ack", "iPhone 助手"), msg or fallback)
 
     def warm_up(self):
@@ -930,7 +1010,16 @@ class Bridge:
                 elif len(pending) > 1:
                     raise ValueError("有多个任务在等你回答，请用“回复 任务编号 内容”指定，或说“新任务：……”")
                 else:
-                    session = "new"
+                    # 刚做完的任务也接着聊（同一个来源、同一个助手、窗口期内）；说“新任务：”才另起。
+                    window = float(self.cfg.get("continue_minutes", 30)) * 60
+                    last = next((t for t in reversed(self.tasks)
+                                 if t.get("client") == client and t["state"] not in ("answered", "cancelled")), None)
+                    if (last and last["state"] == "done" and last.get("session_id") and last["agent"] == agent
+                            and not last.get("quick_answer") and not last.get("stopped")
+                            and time.time() - (last.get("finished") or last.get("created", 0)) < window):
+                        reply_to = last["id"]
+                    else:
+                        session = "new"
             if reply_to is not None:
                 base = self._find(reply_to) if reply_to else next(
                     (t for t in reversed(self.tasks)
@@ -956,6 +1045,8 @@ class Bridge:
                     "user_text": raw_text, "goal": (base.get("goal") or base["text"]) if base else text,
                     "parent_id": base["id"] if base else None,
                     "recovery": recovery_context(base) if base else None,
+                    "unlock_acknowledged": bool(base and base.get("state") == "waiting_unlock" and
+                                                is_unlock_ack(text)),
                     "entry": (base.get("entry") if base and base.get("entry")
                               else primary_entry(self.cfg, agent)),
                     "mode": mode,
@@ -980,7 +1071,13 @@ class Bridge:
         log("收到任务 %s [%s%s] %s" % (task["id"], agent, "/" + mode if mode else "", text))
         # 快捷指令不出声，「收到」用 Bark 推送告诉用户（放后台线程，不拖慢响应）。
         if self.cfg.get("ack_by_push", True):
-            threading.Thread(target=self._push_ack, args=(text, ack, bool(ahead)), daemon=True).start()
+            gate = None
+            if quick_eligible(self.cfg, text, ahead, base):
+                gate = QuickGate()
+                if not hasattr(self, "quick_gates"):
+                    self.quick_gates = {}
+                self.quick_gates[task["id"]] = gate
+            threading.Thread(target=self._push_ack, args=(text, ack, bool(ahead), gate), daemon=True).start()
         return {"ok": True, "id": task["id"], "agent": agent, "ahead": ahead,
                 "resumed": bool(resume), "ack": ack}
 
@@ -1043,6 +1140,28 @@ class Bridge:
                 task["started"] = time.time()
                 self.current = task
                 self._save()
+            gate = getattr(self, "quick_gates", {}).pop(task["id"], None)
+            if gate:
+                gate.event.wait(float(self.cfg.get("quick_wait_secs", 4)))
+                with gate.lock:
+                    gate.closed = True
+                    answer = gate.answer
+                if answer:
+                    log("任务 %s 由回复小模型直接答复，不启动任务模型" % task["id"])
+                    task.update(state="done", result=answer, quick_answer=True, phone_used=False,
+                                session_id=task.get("resume"), finished=time.time())
+                    with self.lock:
+                        self._save()
+                    try:
+                        self._notify(task)
+                        self._finish_phone(task)
+                    except Exception as e:
+                        log("收尾出错：%s（任务仍已保存）" % type(e).__name__)
+                    with self.lock:
+                        self.current, self.proc = None, None
+                        self._save()
+                        self.finished_cv.notify_all()
+                    continue
             self.context.preload()  # 兼容未经过 /wake 的客户端，也接收其他助手刚写入的偏好。
             chain, idx = task_chain(self.cfg, task), 0
             while True:
@@ -1352,7 +1471,8 @@ class Bridge:
         env.update(self.cfg.get("env", {}))
         env.update(self._mcp_env(task))
         atomic_text(os.path.join(WORK_DIR, "context-%s.json" % task["id"]),
-                    json.dumps({"user_text": task.get("user_text") or task["text"]}, ensure_ascii=False))
+                    json.dumps({"user_text": task.get("user_text") or task["text"],
+                                "unlock_acknowledged": task.get("unlock_acknowledged", False)}, ensure_ascii=False))
         if task["agent"] == "claude" and not self.cfg["claude"].get("tool_search", False):
             env["ENABLE_TOOL_SEARCH"] = "false"
         if task["agent"] == "claude":
@@ -1600,7 +1720,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/wait":
             q = parse_qs(url.query)
             secs = min(55.0, float((q.get("timeout") or ["45"])[0]))
-            return self._send(200, self.bridge.wait_latest(self.client_address[0], secs))
+            return self._send(200, self.bridge.wait_latest(client_key(self.client_address[0]), secs))
         if url.path == "/health":
             return self._send(200, {"ok": True})
         if url.path == "/wake":
@@ -1613,7 +1733,7 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         try:
             body = self._body()
-            client = self.client_address[0]
+            client = client_key(self.client_address[0])
             if path in ("/task", "/reply") and is_stop_command(str(body.get("text", ""))):
                 result = self.bridge.stop()
                 result["ack"] = result["speech"]

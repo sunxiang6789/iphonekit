@@ -270,7 +270,12 @@ class Gateway:
             with self.ready_lock:
                 if not self.phone_ready:
                     from bridge import load_config, resume_runner
-                    resume_runner(load_config(write=False))
+                    try:
+                        packet = json.loads(read_text(os.path.join(self.home, "work", "context-%s.json" % self.task_id)) or "{}")
+                    except ValueError:
+                        packet = {}
+                    resume_runner(load_config(write=False),
+                                  allow_passcode_retry=isinstance(packet, dict) and packet.get("unlock_acknowledged") is True)
                     self.phone_ready = True
         if self.task_id and phone_used([{"tool": name}]):
             # 必须先能保存“本轮用过手机”标记再执行，收尾不依赖详细日志是否写成功。

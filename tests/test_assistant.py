@@ -86,6 +86,66 @@ class AssistantTests(unittest.TestCase):
         self.assertIn("已整理攻略", prompt)
         self.assertIn("做旅行攻略", prompt)
 
+    def test_explicit_unlock_reply_can_clear_stale_blocker_once(self):
+        self.waiting(state="waiting_unlock")
+        out = self.br.submit("已经允许 UI 自动化，可以继续", client="client")
+        self.assertTrue(self.br._find(out["id"])["unlock_acknowledged"])
+        self.waiting("22222222", state="waiting_unlock")
+        out = self.br.submit("还没解锁，别继续", client="client")
+        self.assertFalse(self.br._find(out["id"])["unlock_acknowledged"])
+
+    def test_unlock_ack_wording(self):
+        for yes in ("已经允许 UI 自动化，可以继续", "解锁了", "好了，继续", "已解锁。", "OK", "没问题，继续吧"):
+            self.assertTrue(b.is_unlock_ack(yes), yes)
+        for no in ("还没解锁，别继续", "特别想要旅行攻略", "未来再说", "不用继续了", "先不要动",
+                   "等一下我去解锁", "好了吗？", "能继续吗", "", "区别在哪"):
+            self.assertFalse(b.is_unlock_ack(no), no)
+
+    def test_phone_addresses_are_one_client(self):
+        self.assertEqual(b.client_key("169.254.34.159"), b.client_key("192.168.5.23"))
+        self.assertNotEqual(b.client_key("127.0.0.1"), b.client_key("192.168.5.23"))
+
+    def test_finished_task_is_continued_within_window_only(self):
+        task = self.waiting(state="done")
+        task["finished"] = time.time() - 60
+        out = self.br.submit("把刚才整理的放进备忘录", agent="dsh", client="client")
+        self.assertTrue(out["resumed"])
+        self.assertEqual(self.br._find(out["id"])["parent_id"], task["id"])
+        self.assertEqual(self.br._find(out["id"])["resume"], "native-session")
+        out = self.br.submit("新任务：看天气", agent="dsh", client="client")
+        self.assertFalse(out["resumed"])
+        task["finished"] = time.time() - 3 * 3600
+        self.br.tasks[:] = [task]
+        self.assertFalse(self.br.submit("看天气", agent="dsh", client="client")["resumed"])
+        self.assertFalse(self.br.submit("看天气", agent="dsh", client="other")["resumed"])
+
+    def test_simple_question_is_answered_by_ack_model_without_task_model(self):
+        self.cfg = dict(self.cfg, ack_by_push=True)
+        self.assertTrue(b.quick_eligible(self.cfg, "现在几点啦", 0, None))
+        for text in ("帮我打开微信", "把刚才的存起来", "现在几点啦" * 20):
+            self.assertFalse(b.quick_eligible(self.cfg, text, 0, None), text)
+        self.assertFalse(b.quick_eligible(self.cfg, "现在几点啦", 1, None))
+        self.assertFalse(b.quick_eligible(self.cfg, "好了", 0, {"state": "waiting_user"}))
+        gate = b.QuickGate()
+        with patch.object(b, "generate_ack", return_value="直答：下午3点啦") as gen, \
+             patch.object(b, "bark_push") as push:
+            self.br._push_ack("现在几点啦", "收到", False, gate)
+        self.assertTrue(gen.call_args.kwargs["quick"])
+        self.assertEqual(gate.answer, "下午3点啦")
+        self.assertTrue(gate.event.is_set())
+        push.assert_not_called()
+        late = b.QuickGate()
+        late.closed = True
+        with patch.object(b, "generate_ack", return_value="直答：3点"), patch.object(b, "bark_push") as push:
+            self.br._push_ack("现在几点啦", "收到", False, late)
+        push.assert_called_once()
+        plain = b.QuickGate()
+        with patch.object(b, "generate_ack", return_value="收到喔"), patch.object(b, "bark_push") as push:
+            self.br._push_ack("现在几点啦", "收到", False, plain)
+        self.assertIsNone(plain.answer)
+        self.assertTrue(plain.event.is_set())
+        push.assert_called_once()
+
     def test_question_marks_survive_clean_reply_and_push(self):
         for mark, state in ((b.WAIT_MARK, "waiting_user"), (b.UNLOCK_MARK, "waiting_unlock"),
                             (b.CONFIRM_MARK, "needs_confirm")):

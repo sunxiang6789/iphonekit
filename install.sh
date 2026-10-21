@@ -8,7 +8,7 @@
 #   --yes       向导的所有提问用默认值
 #   --skip-iphone-use   不装 / 不 setup iphone-use（已经装好时）
 #   --no-init   装完程序就停，不跑向导
-# 环境变量：IAK_REPO_URL（仓库地址）、IAK_REF（分支或标签，默认 main）
+# 环境变量：IAK_REPO_URL（仓库地址）、IAK_REF（分支或标签，默认 main）、IAK_IPHONE_USE_VERSION（默认 v0.19.1）
 set -euo pipefail
 
 NAME="iphone-agent-kit"
@@ -16,7 +16,9 @@ REPO_URL="${IAK_REPO_URL:-https://github.com/sunxiang6789/sunxiang-ai.git}"
 REF="${IAK_REF:-main}"
 INSTALL_DIR="$HOME/.local/share/$NAME"
 BIN_DIR="$HOME/.local/bin"
-IPHONE_USE_INSTALLER="https://raw.githubusercontent.com/leeguooooo/iphone-use/main/install.sh"
+# 本工具实测的 iphone-use 版本；新版本不保证兼容，所以固定装这个（IAK_IPHONE_USE_VERSION 可改，不建议）。
+IPHONE_USE_VERSION="${IAK_IPHONE_USE_VERSION:-v0.19.1}"
+IPHONE_USE_INSTALLER="https://raw.githubusercontent.com/leeguooooo/iphone-use/$IPHONE_USE_VERSION/install.sh"
 
 DRY=0; YES=0; SKIP_IU=0; NO_INIT=0
 for arg in "$@"; do
@@ -113,11 +115,16 @@ if [ "$SKIP_IU" = 1 ]; then
   say "  已跳过（--skip-iphone-use）"
 else
   if command -v iphone-use >/dev/null 2>&1; then
-    ok "已装 iphone-use：$(command -v iphone-use)"
+    HAVE_IU="$(iphone-use --version 2>/dev/null | head -1 || true)"
+    ok "已装 iphone-use：$(command -v iphone-use)（${HAVE_IU:-版本未知}）"
+    case "$HAVE_IU" in
+      *"${IPHONE_USE_VERSION#v}"*) ;;
+      *) warn "本工具实测的是 iphone-use $IPHONE_USE_VERSION，你装的版本不同，可能不兼容。不会自动降级正在用的版本；想换的话，让助手照 AGENT_INSTALL.md 处理。" ;;
+    esac
   else
-    say "  下载并运行官方安装脚本：$IPHONE_USE_INSTALLER"
-    if [ "$DRY" = 1 ]; then say "  [试运行] curl -fsSL $IPHONE_USE_INSTALLER | sh"
-    else curl -fsSL "$IPHONE_USE_INSTALLER" | sh || die "iphone-use 安装失败，请看上面的报错"; fi
+    say "  固定安装实测过的版本 $IPHONE_USE_VERSION：$IPHONE_USE_INSTALLER"
+    if [ "$DRY" = 1 ]; then say "  [试运行] curl -fsSL $IPHONE_USE_INSTALLER | IPHONE_USE_RELEASE_REF=$IPHONE_USE_VERSION sh"
+    else curl -fsSL "$IPHONE_USE_INSTALLER" | IPHONE_USE_RELEASE_REF="$IPHONE_USE_VERSION" sh || die "iphone-use 安装失败，请看上面的报错"; fi
   fi
   say "  接下来运行 iphone-use setup（TZ=$TZ_NAME）。过程中请把 iPhone 用数据线连上 Mac、解锁、点「信任」，"
   say "  并在 Xcode 里登录你的 Apple ID；手机上要打开「开发者模式」。按它的提示一步步来。"

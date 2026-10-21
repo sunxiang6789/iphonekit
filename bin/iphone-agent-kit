@@ -37,6 +37,7 @@ BIN_LINK = os.path.join(HOME, ".local", "bin", NAME)
 LAUNCH_DIR = os.path.join(HOME, "Library", "LaunchAgents")
 LABEL = "com.iphone-agent-kit.bridge"
 DAILY_LABEL = "com.iphone-agent-kit.daily-check"
+RECOMMENDED_IPHONE_USE = "0.19.1"  # 实测通过的 iphone-use 版本；README 与助手安装指南都推荐装这个
 IPHONE_USE_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.leeguoo.iphone-use.plist")
 IPHONE_USE_DAEMON = "http://127.0.0.1:44321"
 START = "<!-- iphone-agent-kit:start -->"
@@ -488,10 +489,10 @@ def install_cli(name):
 
 
 def check_cli(agents, detected):
-    """方式 B 的后台服务要用助手的命令行版。没有就解释清楚，并（在用户同意后）帮忙装。返回更新后的 detected。"""
+    """后台服务要用助手的命令行版。没有就解释清楚，并（在用户同意后）帮忙装。返回更新后的 detected。"""
     step_title = "【后台服务需要“命令行版”助手】"
     say("\n  " + step_title)
-    say("  方式 B 的后台服务是在后台悄悄调用助手的，靠的是它的「命令行版」——")
+    say("  后台服务是在后台悄悄调用助手的，靠的是它的「命令行版」——")
     say("  就是能在 Mac 的「终端」App 里运行 claude / codex 命令的那种，和你平时点开的桌面版不是一回事。")
     redo = False
     for ag in agents:
@@ -570,32 +571,40 @@ def cmd_init(a):
     cfg = load_json(CONFIG_PATH)
     detected = bridge_check() if os.path.exists(os.path.join(REPO, "bridge", "bridge.py")) else {}
 
-    # 1 用哪种方式
-    step("【1/8】你想怎么给手机下命令？（两种可以都要，以后能再改）")
-    say("  A) 助手自己的手机 App：在 Claude / ChatGPT 手机 App 里远程连电脑上的助手。不用快捷指令，不装后台服务。")
-    say("  B) 快捷指令：对 Siri 说一句话，结果用 Bark 推送回来。适合只有命令行的助手。")
-    say("     ⚠️ 选 B 需要后台服务，后台服务要用助手的「命令行版」（在 Mac 的「终端」里运行的 claude / codex）。没有的话下面会帮你装。")
-    mchoice = {"a": "1", "b": "2", "both": "3"}.get(a.mode) or ask("  1) 只要 A  2) 只要 B  3) 两个都要（推荐）。请选", "3")
-    usage = {"1": "a", "2": "b", "3": "both"}.get(mchoice, "both")
-    use_b = usage in ("b", "both")
+    # 1 纯小白模式（使用方式不再选择：快捷指令、后台服务、直接对话规则全部安装）
+    step("【1/8】准备：全部装好，只问一件事")
+    say("  这个版本默认全部安装：快捷指令（侧边按钮一按就能说）、后台服务、推送，以及直接和助手对话的规则。")
+    if a.mode:
+        say("  （--mode 已不再使用，全部安装。）")
+    usage, use_b = "both", True
     say("")
     say("  【纯小白模式】开启后，助手每次停下来要你动手（付款、刷脸、点信任、登录……）时，")
     say("  会用大白话一步一步告诉你「现在要做什么、点哪里、做完怎么办」，推送也一样。")
     beginner = a.beginner == "on" if a.beginner else confirm("  开启纯小白模式？（第一次用、不懂技术的强烈建议开）", True)
-    say("  → %s" % {"a": "只用方式 A（不装后台服务，不需要快捷指令）", "b": "只用方式 B", "both": "A 和 B 都保留"}[usage])
 
     # 2 选助手
     step("【2/8】你用哪个 AI 助手来操控手机？")
-    say("  检测到：Claude Code %s，Codex %s" % (
-        "✅" if detected.get("claude") else "没找到", "✅" if detected.get("codex") else "没找到"))
-    default_choice = "3" if detected.get("claude") and detected.get("codex") else ("2" if detected.get("codex") else "1")
-    choice = {"claude": "1", "codex": "2", "both": "3"}.get(a.agent) or ask(
-        "  1) Claude Code  2) Codex  3) 两个都用。请选", default_choice)
-    agents = {"1": ["claude"], "2": ["codex"], "3": ["claude", "codex"]}.get(choice, ["claude"])
-    default_agent = agents[0]
-    if len(agents) == 2:
-        default_agent = ask("  %s默认用哪个？claude / codex" % ("快捷指令" if use_b else "后台任务"), "claude")
-        default_agent = default_agent if default_agent in ("claude", "codex") else "claude"
+    say("  检测到：DeepSeek Harness（dsh）%s，Claude Code %s，Codex %s" % (
+        "✅" if detected.get("dsh") else "没找到", "✅" if detected.get("claude") else "没找到",
+        "✅" if detected.get("codex") else "没找到"))
+    say("  推荐 DeepSeek Harness 的命令行 dsh：启动最快（1～2 秒），需要先在桌面版 Models 页保存好 API key。")
+    say("  可多选；排第一个的是默认。1) dsh  2) Claude Code  3) Codex")
+    names = {"1": "dsh", "2": "claude", "3": "codex"}
+    preset = {"dsh": "1", "claude": "2", "codex": "3", "both": "2 3", "all": "1 2 3"}.get(a.agent)
+    if a.dsh == "on" and not preset:
+        preset = "1 2 3"
+    default_sel = "1" if detected.get("dsh") else ("2" if detected.get("claude") else "3")
+    picked = [names[x] for x in re.findall(r"[123]", preset or ask("  请选（例如 1 或 1 2）", default_sel)) if x in names]
+    picked = list(dict.fromkeys(picked)) or ["claude"]
+    dsh_on = "dsh" in picked
+    if dsh_on and not detected.get("dsh"):
+        warn("没找到 DeepSeek Harness", "先装 DeepSeek Harness 桌面版（官方，自带 dsh 命令行），并在 Models 页保存好 API key，再重跑 iphone-agent-kit init")
+        picked.remove("dsh")
+        dsh_on = False
+        if not picked:
+            picked = ["claude"]
+    agents = [x for x in picked if x in ("claude", "codex")]
+    default_agent = picked[0]
     if "claude" in agents:
         if not detected.get("claude"):
             warn("没找到 Claude Code", "先安装 Claude Code")
@@ -607,17 +616,14 @@ def cmd_init(a):
                 warn("Claude Code 好像还没登录（桥接服务需要它自己登录一次）", "在终端运行：claude auth login")
     if "codex" in agents and not detected.get("codex"):
         warn("没找到 Codex", "先安装 Codex 命令行，或之后在 config.json 的 codex.bin 里写路径")
-
-    if use_b:
+    if agents:
         detected = check_cli(agents, detected)
-
-    dsh_on = False
-    if use_b and detected.get("dsh"):
-        say("\n  检测到 DeepSeek Harness（官方 dsh 命令行）。")
-        dsh_on = a.dsh == "on" if a.dsh else confirm("  也配上 DeepSeek 吗？（开头说「用 DeepSeek，……」就走它；需要你有 DeepSeek 的 API key）", False)
+    if dsh_on:
+        say("  dsh 会得到一个专用配置：只能用手机工具，跑命令、读写文件、联网都锁死。")
+        say("  ⚠️ API key：打开 DeepSeek Harness 桌面版 → Models 页面填好（账号登录自动生成的 key 命令行用不了，要自己去 platform.deepseek.com 新建）。")
 
     # 2 Bark
-    step("【3/8】Bark 推送（%s）" % ("必配：快捷指令只回「收到」，做完的结果靠 Bark 推送到手机" if use_b else "方式 A 可选：用来收「要你付款/确认」的提醒"))
+    step("【3/8】Bark 推送（必配：做完的结果、要你付款或解锁的提醒，全靠它推到手机）")
     say("  去 iPhone 的 App Store 搜「Bark」（作者 Finb）安装，打开后首页会显示一个网址，")
     say("  形如 https://api.day.app/XXXXXXXX/ ，中间那串 XXXXXXXX 就是你的 key。可以把整个网址粘贴过来。")
     say("  暂时不想配可以留空，以后再运行 init 或直接改 config.json。")
@@ -664,7 +670,7 @@ def cmd_init(a):
     bark.setdefault("group", "iPhone助手")
     bark["device_keys"] = keys
     new_cfg["bark"] = bark
-    new_cfg["kit"] = {"beginner": beginner, "usage": usage, "agents": agents, "takeout_direct_pay": takeout, "daily_check": daily}
+    new_cfg["kit"] = {"beginner": beginner, "usage": usage, "agents": picked, "takeout_direct_pay": takeout, "daily_check": daily}
     if not DRY:
         os.makedirs(KIT_HOME, mode=0o700, exist_ok=True)
         os.chmod(KIT_HOME, 0o700)
@@ -715,15 +721,6 @@ def cmd_init(a):
     step("【8/8】注册后台服务（开机自启，快捷指令发来的任务由它接）")
     if a.no_launchd:
         say("  已跳过（--no-launchd）")
-    elif not use_b:
-        say("  只用方式 A，不需要后台服务。")
-        if not DRY and os.path.exists(plist_path(LABEL)):
-            remove_service(LABEL)
-            ok("之前注册过的桥接服务已停掉")
-        if daily:
-            install_service(DAILY_LABEL, daily_plist())
-        elif not DRY and os.path.exists(plist_path(DAILY_LABEL)):
-            remove_service(DAILY_LABEL)
     else:
         install_service(LABEL, bridge_plist())
         if daily:
@@ -742,10 +739,9 @@ def cmd_init(a):
     say("\n=== 完成%s ===" % "（试运行，什么都没改）" if DRY else "\n=== 完成 ===")
     say("下一步：")
     say("  1. iphone-agent-kit doctor      体检一遍")
-    if use_b:
-        say("  2. iphone-agent-kit shortcuts   生成快捷指令，隔空投送到手机（方式 B）")
-    if usage != "b":
-        say("  %s. 方式 A：在助手的手机 App 里远程连电脑，见 docs/方式A-助手手机端.md" % ("3" if use_b else "2"))
+    say("  2. iphone-agent-kit shortcuts   生成快捷指令，隔空投送到手机，再设成「侧边按钮」（主推）或放主屏幕")
+    say("     设置 → 操作按钮 → 快捷指令 → 选「让手机做事」（iPhone 15 Pro 及以上）；其他机型放主屏幕或设背面轻点")
+    say("  3. 想在手机上远程用电脑里的助手：见 docs/助手手机App远程用.md（需要助手有手机控制端）")
     say("  最后. 编辑 %s 填上你的口味和地址" % prof)
     return 0
 
@@ -781,6 +777,9 @@ def cmd_doctor(a):
     else:
         code, v = run_iphone_use(["--version"], timeout=20)
         ok("%s（%s）" % (v.splitlines()[0] if v and code == 0 else "iphone-use 版本未知", exe))
+        if code == 0 and RECOMMENDED_IPHONE_USE not in v:
+            warn("本工具是在 iphone-use %s 上测试的，你装的版本不同，可能有不兼容" % RECOMMENDED_IPHONE_USE,
+                 "推荐装 %s：见 README「推荐版本」，或让助手照 AGENT_INSTALL.md 处理（别擅自降级正在用的版本，先问你）" % RECOMMENDED_IPHONE_USE)
         code, out = run_iphone_use(["doctor"], timeout=90)
         if code == 0:
             ok("iphone-use doctor 通过")
@@ -792,8 +791,9 @@ def cmd_doctor(a):
     step("助手和 MCP")
     found = bridge_check()
     cfg = load_json(CONFIG_PATH)
-    agents = (cfg.get("kit") or {}).get("agents") or ["claude", "codex"]
-    for name, label, fix in (("claude", "Claude Code", "安装 Claude Code 并运行 claude auth login"),
+    agents = (cfg.get("kit") or {}).get("agents") or ["dsh", "claude", "codex"]
+    for name, label, fix in (("dsh", "DeepSeek Harness（dsh）", "安装 DeepSeek Harness 桌面版，并在 Models 页保存 API key"),
+                             ("claude", "Claude Code", "安装 Claude Code 并运行 claude auth login"),
                              ("codex", "Codex", "安装 Codex 命令行"),
                              ("iphone_use_mcp", "iphone-use-mcp", "运行 iphone-use setup")):
         if found.get(name):
@@ -810,11 +810,8 @@ def cmd_doctor(a):
         ok("配置文件存在")
         mode = os.stat(CONFIG_PATH).st_mode & 0o777
         ok("权限 %o" % mode) if mode == 0o600 else warn("配置文件权限是 %o，里面有令牌" % mode, "chmod 600 '%s'" % CONFIG_PATH)
-        usage = (cfg.get("kit") or {}).get("usage", "both")
         loaded, _ = service_loaded(LABEL)
-        if usage == "a":
-            ok("你选的是只用方式 A，不需要后台服务")
-        elif not loaded:
+        if not loaded:
             B("后台服务没在运行", "iphone-agent-kit restart；还不行就 iphone-agent-kit init")
         else:
             try:
@@ -824,8 +821,8 @@ def cmd_doctor(a):
                 B("桥接服务连不上：%s" % e, "iphone-agent-kit logs 看日志，再 iphone-agent-kit restart")
         keys = (cfg.get("bark") or {}).get("device_keys") or []
         ok("Bark 已配置（%d 台设备）" % len(keys)) if keys else warn(
-            "还没配 Bark：" + ("要你付款/确认的提醒收不到" if usage == "a" else "快捷指令发的任务结果收不到"), "运行 iphone-agent-kit init 补上 Bark key")
-        for ag in agents:
+            "还没配 Bark：快捷指令发的任务结果、付款和解锁提醒都收不到", "运行 iphone-agent-kit init 补上 Bark key")
+        for ag in [x for x in agents if x in AGENT_FILES]:
             if START in read_text(AGENT_FILES.get(ag, "")):
                 ok("%s 的规则已写入 %s" % (ag, AGENT_FILES[ag]))
             else:
@@ -892,8 +889,6 @@ def cmd_shortcuts(a):
     if not cfg.get("token"):
         bad("还没有配置/令牌", "先运行 iphone-agent-kit init")
         return 1
-    if (cfg.get("kit") or {}).get("usage") == "a":
-        warn("你当时选的是「只用方式 A」，后台服务没装，快捷指令发出的任务不会有人接", "要用方式 B：运行 iphone-agent-kit init，选 B 或 都要")
     out = os.path.expanduser(a.out)
     cmd = ["/usr/bin/python3", os.path.join(REPO, "bridge", "make_shortcuts.py"), "--out", out]
     if a.url:
@@ -1041,10 +1036,10 @@ def main():
     s = sub.add_parser("init", help="安装向导")
     s.add_argument("--dry-run", action="store_true", help="试运行，不改任何文件")
     s.add_argument("--yes", action="store_true", help="所有提问用默认值（测试/脚本用）")
-    s.add_argument("--mode", choices=["a", "b", "both"], help="用哪种方式：a 助手手机端 / b 快捷指令 / both 都要")
+    s.add_argument("--mode", choices=["a", "b", "both"], help="（已不再使用：现在默认全部安装）")
     s.add_argument("--beginner", choices=["on", "off"], help="纯小白模式：助手停下来时要把怎么操作讲清楚")
-    s.add_argument("--dsh", choices=["on", "off"], help="同时配置 DeepSeek Harness（官方 dsh）")
-    s.add_argument("--agent", choices=["claude", "codex", "both"])
+    s.add_argument("--dsh", choices=["on", "off"], help="（旧参数）等同于 --agent all")
+    s.add_argument("--agent", choices=["dsh", "claude", "codex", "both", "all"], help="用哪个助手；both=claude+codex，all=三个都用")
     s.add_argument("--bark-key")
     s.add_argument("--persona", choices=["on", "off"])
     s.add_argument("--takeout-direct-pay", action="store_true")
