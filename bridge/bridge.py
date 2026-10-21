@@ -149,6 +149,24 @@ DEFAULT_CONFIG = {
         "profile": "iak",
         "ack_profile": "iak-ack",
     },
+    # 任务用哪个助手的哪个模型，以及“备用”：主的出错/没额度时自动换下一个接着做。
+    # agent 留空 = 用上面的 default_agent；model/effort 留空 = 用该助手自己的默认。
+    #   claude 的 model 例：claude-sonnet-5-5；codex 的 model 例：gpt-6.1-sol；
+    #   dsh 的 model 写“服务商/模型”，例：inception/mercury-3、deepseek-official/deepseek-flash（effort 可选 off/low/high/max）。
+    "task": {
+        "agent": "",
+        "model": "",
+        "effort": "",
+        "fallbacks": [],          # 例：[{"agent": "codex"}, {"agent": "claude", "model": "claude-sonnet-5-5"}]
+        "fast_fail_secs": 20,     # 失败得很快（多半是没额度/key 错/模型名不对）也会换备用
+    },
+    # 「收到」那句回复用哪个助手的哪个模型：按顺序试，前一个出错就换下一个；都不行用固定的话。
+    "ack": {
+        "chain": [
+            {"agent": "dsh", "profile": "iak-ack", "model": "deepseek-official/deepseek-flash", "effort": "off"},
+            {"agent": "claude", "model": "claude-haiku-5-5"},
+        ],
+    },
     # 被控手机发来的任务做完后，让它自己运行「手机朗读」快捷指令把回复念出来（默认关）。
     # 需要被控手机装了「手机朗读」，且 iphone-use 允许打开 shortcuts:// 链接（IPHONE_USE_ALLOW_URL_SCHEMES=shortcuts）。
     "phone_speak": {
@@ -174,6 +192,7 @@ PHRASES = {
     "stop_idle": ("我本来就没在做事啦～", "现在没有在做的事。"),
     "stopped_result": ("好啦，停下来了～", "已停止。"),
     "cancelled": ("已经取消啰", "已取消。"),
+    "switched": ("老板，%s出问题了，换%s接着做喔～", "%s没做成，已换%s接着做。"),
     "stop_acked": ("好～", "好的。"),
     "no_task": ("没找到你刚刚发的任务耶", "没有找到你刚发的任务。"),
     "done_empty": ("做完了", "做完了。"),
@@ -410,42 +429,97 @@ def to_simplified(text):
     return "".join(_TRAD.get(ch, ch) for ch in text)
 
 
-def _ack_via_dsh(cfg, prompt, env, timeout):
-    """DeepSeek flash（不思考、不带任何工具）：约 1～2 秒。"""
-    profile = (cfg.get("dsh") or {}).get("ack_profile") or "iak-ack"
-    out = subprocess.run([find_dsh(cfg), "--profile", profile, prompt], capture_output=True, text=True,
-                         env=env, stdin=subprocess.DEVNULL, cwd=WORK_DIR, timeout=timeout)
+def dsh_overlay(model, effort):
+    """dsh 的 --patch 覆盖层：临时换模型/档位。model 写“服务商/模型”，没有斜杠就当 deepseek-official。返回文件路径或 None。"""
+    if not model and not effort:
+        return None
+    lines = ["- id: agent-default-model", "  name: '@deepseek-ai/dsh-agent-default-model'", "  config:"]
+    if model:
+        provider, _, name = model.rpartition("/")
+        lines += ["    provider: %s" % (provider or "deepseek-official"), "    model: %s" % name]
+    if effort:
+        lines.append("    reasoningEffort: %s" % effort)
+    path = os.path.join(WORK_DIR, "dsh-%s.yml" % uuid.uuid4().hex[:8])
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return path
+
+
+def _ack_via_dsh(cfg, entry, prompt, env, timeout):
+    profile = entry.get("profile") or (cfg.get("dsh") or {}).get("ack_profile") or "iak-ack"
+    cmd = [find_dsh(cfg), "--profile", profile]
+    overlay = dsh_overlay(entry.get("model"), entry.get("effort"))
+    if overlay:
+        cmd += ["--patch", overlay]
+    try:
+        out = subprocess.run(cmd + [prompt], capture_output=True, text=True, env=env,
+                             stdin=subprocess.DEVNULL, cwd=WORK_DIR, timeout=timeout)
+    finally:
+        if overlay:
+            try:
+                os.remove(overlay)
+            except OSError:
+                pass
     if out.returncode != 0:
         raise RuntimeError("dsh 退出码 %s：%s" % (out.returncode, out.stderr.strip()[-120:]))
     return out.stdout
 
 
-def _ack_via_claude(cfg, prompt, env, timeout):
-    """Haiku：约 5～8 秒（命令行启动慢），只在 dsh 不可用时兜底。"""
-    r = cfg.get("routing") or {}
+def _ack_via_claude(cfg, entry, prompt, env, timeout):
     env = dict(env); env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
-    cmd = [find_claude(cfg), "-p", prompt, "--model", r.get("classifier_model", "claude-haiku-5-5"),
+    cmd = [find_claude(cfg), "-p", prompt, "--model", entry.get("model") or "claude-haiku-5-5",
            "--setting-sources", cfg["claude"].get("setting_sources", "project,local"),
            "--strict-mcp-config", "--tools", "", "--output-format", "json"]
+    if entry.get("effort"):
+        cmd += ["--effort", entry["effort"]]
     out = subprocess.run(cmd, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL,
                          cwd=WORK_DIR, timeout=timeout)
     return json.loads(out.stdout).get("result") or ""
 
 
+def _ack_via_codex(cfg, entry, prompt, env, timeout):
+    out_file = os.path.join(WORK_DIR, "ack-%s.txt" % uuid.uuid4().hex[:8])
+    cmd = [find_codex(cfg), "exec", "--skip-git-repo-check", "--ignore-user-config", "-o", out_file,
+           "--disable", "apps", "--disable", "plugins", "--disable", "memories",
+           "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
+           "-c", "suppress_unstable_features_warning=true"]
+    if entry.get("model"):
+        cmd += ["-m", entry["model"]]
+    cmd += ["-c", 'model_reasoning_effort="%s"' % (entry.get("effort") or "low")]
+    try:
+        subprocess.run(cmd + [prompt], capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL,
+                       cwd=WORK_DIR, timeout=timeout)
+        with open(out_file, encoding="utf-8") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(out_file)
+        except OSError:
+            pass
+
+
+ACK_RUNNERS = {"dsh": _ack_via_dsh, "claude": _ack_via_claude, "codex": _ack_via_codex}
+
+
 def generate_ack(cfg, text):
-    """现编一句和指令相关的「收到」：先用 DeepSeek flash（快），不行再用 Haiku；都失败或输出不像样返回 None，由固定的话兜底。"""
+    """现编一句和指令相关的「收到」：按 ack.chain 的顺序试，前一个出错/没额度就换下一个；都不行返回 None，由固定的话兜底。"""
     persona = (cfg.get("persona") or {}).get("enabled", True)
     prompt = (ACK_PROMPT_PERSONA if persona else ACK_PROMPT_PLAIN) + text[:300]
     env = dict(os.environ); env.update(cfg.get("env", {}))
     timeout = float(cfg.get("ack_timeout_secs", 10))
-    for name, fn in (("dsh", _ack_via_dsh), ("claude", _ack_via_claude)):
+    for entry in (cfg.get("ack") or {}).get("chain") or []:
+        fn = ACK_RUNNERS.get((entry.get("agent") or "").lower())
+        if not fn:
+            log("回复语：不认识的助手 %r，跳过" % entry.get("agent"))
+            continue
         try:
-            lines = fn(cfg, prompt, env, timeout).strip().splitlines()
+            lines = fn(cfg, entry, prompt, env, timeout).strip().splitlines()
             line = to_simplified((lines[0] if lines else "").strip().strip("\"“”'「」"))
             if 2 <= len(line) <= 40:
                 return line
+            log("回复语（%s）输出不像样，换下一个" % entry.get("agent"))
         except Exception as e:
-            log("生成回复语（%s）失败：%s" % (name, e))
+            log("回复语（%s %s）失败，换下一个：%s" % (entry.get("agent"), entry.get("model") or "", e))
     return None
 
 
@@ -621,6 +695,44 @@ def phone_speak(cfg, text):
 
 # ---------------------------------------------------------------- 任务
 
+FALLBACK_PAT = re.compile(
+    r"quota|insufficient|balance|billing|credit|usage.?limit|rate.?limit|too many requests|overload|"
+    r"\b(401|402|403|429|500|502|503|529)\b|unauthor|forbidden|invalid.?(api|key|request)|api.?key|"
+    r"MISSING_CREDENTIAL|INVALID_CREDENTIAL|INVALID_REQUEST|not.?found|model.*(not|unavailable|unsupported)|"
+    r"ECONN|network|timed out|no such host|余额|额度|欠费|限流|没有可用|没有回复|找不到|未找到|连不上|登录",
+    re.I)
+
+
+def primary_entry(cfg, agent):
+    """这个任务的主用助手/模型。task.model、task.effort 只对 task.agent（没填就是 default_agent）生效；
+    开头说「用 Codex，……」临时换了助手时，用那个助手自己的默认。"""
+    t = cfg.get("task") or {}
+    main = (t.get("agent") or cfg["default_agent"]).lower()
+    if agent == main:
+        return {"agent": agent, "model": t.get("model") or "", "effort": t.get("effort") or ""}
+    return {"agent": agent, "model": "", "effort": ""}
+
+
+def task_chain(cfg, task):
+    """主用 + 备用（去重）。接着上次对话的任务只能用原来的助手，不换。"""
+    first = task.get("entry") or primary_entry(cfg, task["agent"])
+    chain = [first]
+    if task.get("resume"):
+        return chain
+    for e in (cfg.get("task") or {}).get("fallbacks") or []:
+        agent = (e.get("agent") or "").lower()
+        if agent not in AGENTS:
+            continue
+        e = {"agent": agent, "model": e.get("model") or "", "effort": e.get("effort") or ""}
+        if all((e["agent"], e["model"]) != (x["agent"], x["model"]) for x in chain):
+            chain.append(e)
+    return chain
+
+
+def entry_label(e):
+    return AGENT_NAMES[e["agent"]] + (" " + e["model"] if e.get("model") else "")
+
+
 class Bridge:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -741,6 +853,8 @@ class Bridge:
                 mode = classify(text, self.cfg)
             # classifier=haiku 时 mode 留空，开始执行前再判断，不耽误马上回「收到」
             task = {"id": uuid.uuid4().hex[:8], "text": text, "agent": agent, "resume": resume,
+                    "entry": (base.get("entry") if reply_to is not None and base and base.get("entry")
+                              else primary_entry(self.cfg, agent)),
                     "mode": mode,
                     "state": "queued", "created": time.time(), "result": "", "session_id": None,
                     "client": client, "speak_on_phone": bool(speak)}
@@ -823,15 +937,20 @@ class Bridge:
                 task["started"] = time.time()
                 self.current = task
                 self._save()
-            if task["agent"] == "claude" and not task.get("mode") and (self.cfg.get("routing") or {}).get("enabled"):
-                t0 = time.time()
-                task["mode"] = classify_with_haiku(task["text"], self.cfg) or classify(task["text"], self.cfg)
-                log("任务 %s 分流：%s（%.1f 秒）" % (task["id"], task["mode"], time.time() - t0))
-            try:
-                self._run(task)
-            except Exception as e:
-                task["state"], task["result"] = "failed", "桥接服务出错：%s" % e
-                log("任务 %s 出错：%s" % (task["id"], e))
+            chain, idx = task_chain(self.cfg, task), 0
+            while True:
+                self._attempt(task)
+                if idx + 1 >= len(chain) or not self._should_fallback(task):
+                    break
+                prev, idx = chain[idx], idx + 1
+                nxt = chain[idx]
+                log("任务 %s：%s 没做成（%s），换 %s 接着做" % (
+                    task["id"], entry_label(prev), (task.get("result") or "")[:100].replace("\n", " "), entry_label(nxt)))
+                threading.Thread(target=bark_push, args=(
+                    self.cfg, self.cfg["push_titles"].get("ack", "iPhone 助手"),
+                    phrase(self.cfg, "switched", entry_label(prev), entry_label(nxt))), daemon=True).start()
+                task.update(entry=nxt, agent=nxt["agent"], mode=None, resume=None, session_id=None,
+                            fallback_from=prev["agent"], state="running", result="")
             with self.lock:
                 if task.get("stopped"):
                     task["state"] = "stopped"
@@ -848,10 +967,44 @@ class Bridge:
             if self.cfg.get("stop_runner_after_task", True) and (task["state"] == "needs_confirm" or idle):
                 stop_runner(self.cfg)
 
+    def _attempt(self, task):
+        """用 task 里当前的助手/模型跑一遍。"""
+        task["attempt_started"] = time.time()
+        if task["agent"] == "claude" and not task.get("mode") and (self.cfg.get("routing") or {}).get("enabled"):
+            t0 = time.time()
+            task["mode"] = classify_with_haiku(task["text"], self.cfg) or classify(task["text"], self.cfg)
+            log("任务 %s 分流：%s（%.1f 秒）" % (task["id"], task["mode"], time.time() - t0))
+        try:
+            self._run(task)
+        except Exception as e:
+            task["state"], task["result"] = "failed", "桥接服务出错：%s" % e
+            log("任务 %s 出错：%s" % (task["id"], e))
+        finally:
+            ov = task.pop("_overlay", None)
+            if ov:
+                try:
+                    os.remove(ov)
+                except OSError:
+                    pass
+
+    def _should_fallback(self, task):
+        """失败了要不要换备用：没被用户叫停、不是超时，并且（失败得很快 或 报错像是没额度/key/模型/网络问题）。"""
+        if task["state"] != "failed" or task.get("stopped"):
+            return False
+        text = task.get("result") or ""
+        if "超时" in text:
+            return False
+        fast = float((self.cfg.get("task") or {}).get("fast_fail_secs", 20))
+        return time.time() - task.get("attempt_started", 0) < fast or bool(FALLBACK_PAT.search(text))
+
     def _prompt(self, task):
         if task["resume"]:
             return task["text"]
         rules = strip_simple_rules(read_rules(self.cfg), task.get("mode"))
+        if task.get("fallback_from"):
+            rules += ("\n\n注意：上一个助手（%s）中途出错了，手机上可能已经做了一部分。"
+                      "先看当前屏幕判断进度，再继续；不要重复已经做完的步骤，尤其是付款、发送、提交这类动作。"
+                      % AGENT_NAMES.get(task["fallback_from"], task["fallback_from"]))
         return "%s\n\n---\n用户指令：%s" % (rules, task["text"]) if rules else task["text"]
 
     def _command(self, task, out_file):
@@ -874,10 +1027,11 @@ class Bridge:
                          "-c", 'approval_policy="never"',
                          "-c", "suppress_unstable_features_warning=true",
                          "-c", "mcp_servers.iphone-use.command=%s" % json.dumps(mcp_bin)]
-            if c.get("model"):
-                opts += ["-m", c["model"]]
-            if c.get("reasoning_effort"):
-                opts += ["-c", 'model_reasoning_effort="%s"' % c["reasoning_effort"]]
+            entry = task.get("entry") or {}
+            if entry.get("model") or c.get("model"):
+                opts += ["-m", entry.get("model") or c["model"]]
+            if entry.get("effort") or c.get("reasoning_effort"):
+                opts += ["-c", 'model_reasoning_effort="%s"' % (entry.get("effort") or c["reasoning_effort"])]
             if c.get("service_tier"):
                 opts += ["-c", 'service_tier="%s"' % c["service_tier"]]
             if task["resume"]:
@@ -885,7 +1039,13 @@ class Bridge:
             return [codex_bin, "exec"] + opts + [prompt]
         if task["agent"] == "dsh":
             d = self.cfg.get("dsh") or {}
-            cmd = [find_dsh(self.cfg), "--profile", d.get("profile") or "iak", "--json"]
+            cmd = [find_dsh(self.cfg), "--profile", d.get("profile") or "iak"]
+            entry = task.get("entry") or {}
+            overlay = dsh_overlay(entry.get("model"), entry.get("effort"))
+            if overlay:
+                task["_overlay"] = overlay  # 跑完后删
+                cmd += ["--patch", overlay]  # --patch 必须放在 --json 之前，否则被当成应用参数
+            cmd += ["--json"]
             if task["resume"]:
                 cmd += ["--session-id", task["resume"]]
             return cmd + [prompt]
@@ -905,7 +1065,9 @@ class Bridge:
             "env": {"TZ": self.cfg.get("env", {}).get("TZ") or system_tz(),
                     "IPHONE_USE_OWNER": phone_owner(self.cfg)}}}}
         cmd += ["--mcp-config", json.dumps(mcp), "--strict-mcp-config"]
-        model, effort = route.get("model") or c.get("model"), route.get("effort") or c.get("effort")
+        entry = task.get("entry") or {}
+        model = entry.get("model") or route.get("model") or c.get("model")
+        effort = entry.get("effort") or route.get("effort") or c.get("effort")
         if model:
             cmd += ["--model", model]
         if effort:
@@ -927,7 +1089,8 @@ class Bridge:
         if task["agent"] == "claude":
             # 不读用户自己的 ~/.claude/CLAUDE.md：里面直接对话用的规则（关 runner、推送、不抢手机……）会和桥接的规则打架。
             env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
-        log("开始任务 %s：%s%s" % (task["id"], task["agent"], "（接着上次对话）" if task["resume"] else ""))
+        log("开始任务 %s：%s%s" % (task["id"], entry_label(task.get("entry") or {"agent": task["agent"]}),
+                                  "（接着上次对话）" if task["resume"] else ""))
         proc = subprocess.Popen(cmd, cwd=WORK_DIR, env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 start_new_session=True)

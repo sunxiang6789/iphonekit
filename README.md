@@ -147,6 +147,43 @@ iphone-agent-kit doctor
 - 之后在指令开头说「用 DeepSeek，……」（或「用 dsh，……」）就走它。
 - 命令行版依赖官方的 MCP 插件 `@deepseek-ai/dsh-mcp-client`，向导会自动装；`dsh` 目前是候选版本（0.2.x），更新后如果不好用，重跑 `iphone-agent-kit init`。
 
+## 自己选模型、设备用模型
+
+在 `~/.config/iphone-agent-kit/config.json` 里改，改完运行 `iphone-agent-kit restart`。完整例子见 [config.example.json](config.example.json)。
+
+**任务用哪个助手、哪个模型，出错换谁：**
+
+```json
+{
+  "default_agent": "dsh",
+  "task": {
+    "model": "inception/mercury-3",
+    "effort": "",
+    "fallbacks": [{"agent": "codex"}, {"agent": "claude", "model": "claude-sonnet-5-5"}]
+  }
+}
+```
+
+- `default_agent`：`claude` / `codex` / `dsh`（DeepSeek Harness）。`model`、`effort` 留空就用该助手自己的默认。
+- `dsh` 的模型写成「服务商/模型」，例如 `deepseek-official/deepseek-flash`、`inception/mercury-3`；`effort` 可选 `off` / `low` / `high` / `max`。用到自己加的服务商，要先在 `~/.dsh/profiles/iak/cordis.patch.yml` 里把它配上。
+- `fallbacks` 是备用，按顺序试：主用出错（没额度、key 失效、模型名不对、网络问题），或者失败得特别快（20 秒内），就自动换下一个接着做，同时推送告诉你换了谁。换的时候会提醒新助手「手机上可能已经做了一部分，别重复付款/发送」。超时和你自己叫停的不会换。
+
+**「收到」那句回复用哪个模型：**
+
+```json
+{
+  "ack": {
+    "chain": [
+      {"agent": "dsh", "profile": "iak-ack", "model": "deepseek-official/deepseek-flash", "effort": "off"},
+      {"agent": "claude", "model": "claude-haiku-5-5"}
+    ]
+  }
+}
+```
+
+- 按顺序试，前一个出错就换下一个；都不行就用固定的话。可以用 `dsh` / `claude` / `codex`，建议选快的：DeepSeek flash 约 1～2 秒，水星 3 约 3 秒，Claude Haiku 约 6 秒，Codex 一般超过 10 秒（不建议）。
+- 回复和任务是**同时启动**的，哪怕用的不是同一个助手：你一发指令，回复那边和任务那边各自开跑，互不等待。
+
 ## 命令速查
 
 | 命令 | 做什么 |
