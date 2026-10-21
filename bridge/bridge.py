@@ -390,6 +390,47 @@ def classify_with_haiku(text, cfg):
     return "think" if "think" in answer else "simple" if "simple" in answer else None
 
 
+ACK_PROMPT_PERSONA = (
+    "你是小柚，18 岁台湾女生，称呼用户“老板”。用户刚用语音发来一条指令，你先用一句话回应：表示收到、马上去办。"
+    "要求：必须和指令内容相关（点出要做什么），不超过 20 个字，像 LINE 聊天，带「啦、喔、欸」这类语气，"
+    "只能用简体字，绝对不能出现繁体字（例如“幫”要写“帮”，“鬧鐘”要写“闹钟”，“設定”要写“设定”），不要引号、不要解释、不要承诺结果，只输出这一句话。\n用户指令：")
+ACK_PROMPT_PLAIN = (
+    "用户刚用语音发来一条指令，你先用一句话回应：表示收到、马上去办。"
+    "要求：必须和指令内容相关（点出要做什么），不超过 20 个字，语气自然礼貌，"
+    "只用简体中文，不要引号、不要解释、不要承诺结果，只输出这一句话。\n用户指令：")
+
+
+# 模型偶尔会漏出繁体字；常见的几十个在这里换成简体（不全，只是兜底）。
+_TRAD = dict(zip("幫鬧鐘設開關這個麼們來說會時點還對現覺機訊號傳發請問題見學習電腦視頻後從處啟動體應當總於將為與讓無備麼戶歡離準確認長門間裡邊",
+                 "帮闹钟设开关这个么们来说会时点还对现觉机讯号传发请问题见学习电脑视频后从处启动体应当总于将为与让无备么户欢离准确认长门间里边"))
+
+
+def to_simplified(text):
+    return "".join(_TRAD.get(ch, ch) for ch in text)
+
+
+def generate_ack(cfg, text):
+    """用 Haiku 现编一句和指令相关的「收到」。出错、超时或输出不像样都返回 None，由固定的话兜底。"""
+    r = cfg.get("routing") or {}
+    persona = (cfg.get("persona") or {}).get("enabled", True)
+    env = dict(os.environ); env.update(cfg.get("env", {}))
+    env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
+    try:
+        cmd = [find_claude(cfg), "-p", (ACK_PROMPT_PERSONA if persona else ACK_PROMPT_PLAIN) + text[:300],
+               "--model", r.get("classifier_model", "claude-haiku-5-5"),
+               "--setting-sources", cfg["claude"].get("setting_sources", "project,local"),
+               "--strict-mcp-config", "--tools", "", "--output-format", "json"]
+        out = subprocess.run(cmd, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL,
+                             cwd=WORK_DIR, timeout=float(cfg.get("ack_timeout_secs", 10)))
+        line = (json.loads(out.stdout).get("result") or "").strip().splitlines()
+        line = (line[0] if line else "").strip().strip("\"“”'「」")
+    except Exception as e:
+        log("生成回复语失败，用固定的话：%s" % e)
+        return None
+    line = to_simplified(line)
+    return line if 2 <= len(line) <= 40 else None
+
+
 def strip_simple_rules(rules, mode):
     """rules.md 里 <!-- 简单任务 --> … <!-- /简单任务 --> 之间的"要快"规则只给简单任务。"""
     if mode == "think":
@@ -579,6 +620,15 @@ class Bridge:
         os.makedirs(WORK_DIR, exist_ok=True)
         threading.Thread(target=self._worker, daemon=True).start()
 
+    def _push_ack(self, text, fallback, queued):
+        """推「收到」。默认让小模型按指令内容现编一句（排队时仍用固定的话，因为要说前面还有几件）；失败就用固定的话。"""
+        msg = None
+        if self.cfg.get("ack_mode", "llm") == "llm" and not queued:
+            t0 = time.time()
+            msg = generate_ack(self.cfg, text)
+            log("回复语：%s（%.1f 秒）" % (msg or "生成失败，用固定的话", time.time() - t0))
+        bark_push(self.cfg, self.cfg["push_titles"].get("ack", "iPhone 助手"), msg or fallback)
+
     def warm_up(self):
         """快捷指令一开始（用户还在说话）就叫醒：提前把桥接自己关掉的 runner 重新接管好，说完话就能直接开工。
         用户自己手动关的（没有标记文件）不会动。叫醒后 90 秒内没有任务来（用户取消了），就再把 runner 关掉。"""
@@ -692,8 +742,7 @@ class Bridge:
         log("收到任务 %s [%s%s] %s" % (task["id"], agent, "/" + mode if mode else "", text))
         # 快捷指令不出声，「收到」用 Bark 推送告诉用户（放后台线程，不拖慢响应）。
         if self.cfg.get("ack_by_push", True):
-            threading.Thread(target=bark_push, args=(self.cfg, self.cfg["push_titles"].get("ack", "iPhone 助手"), ack),
-                             daemon=True).start()
+            threading.Thread(target=self._push_ack, args=(text, ack, bool(ahead)), daemon=True).start()
         return {"ok": True, "id": task["id"], "agent": agent, "ahead": ahead,
                 "resumed": bool(resume), "ack": ack}
 
