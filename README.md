@@ -199,6 +199,13 @@ iphone-agent-kit doctor
 | `iphone-agent-kit fix-xcode` | Xcode 路径有空格时建替身 |
 | `iphone-agent-kit uninstall` | 卸载（不会动 iphone-use 本体） |
 
+## 版本与更新
+
+- 当前版本和每个版本改了什么：看 [Releases](https://github.com/sunxiang6789/sunxiang-ai/releases) 或 [CHANGELOG.md](CHANGELOG.md)。
+- 查看自己装的版本：`iphone-agent-kit --version`（体检 `doctor` 里也会显示）。
+- 更新到最新版：重新运行一遍上面的安装命令（只会更新程序，不会覆盖你的配置）。
+- 想固定在某个版本：`IAK_REF=v0.1.0 bash install.sh`（或在安装命令前加 `IAK_REF=v0.1.0`）。
+
 ## 常见问题
 
 出问题先跑 `iphone-agent-kit doctor`。按现象查：[docs/常见问题.md](docs/常见问题.md)，里面有 Xcode 路径空格、时区、手机被占用、7 天签名到期、Claude 没登录、Bark 收不到、手机连不上、不在家怎么用、模型名不可用等。

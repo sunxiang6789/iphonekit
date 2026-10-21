@@ -762,6 +762,7 @@ def cmd_doctor(a):
 
     say("=== iphone-agent-kit 体检 ===")
     step("系统")
+    ok("iphone-agent-kit %s" % kit_version())
     code, ver = run(["sw_vers", "-productVersion"], timeout=5)
     ok("macOS %s，%s" % (ver if code == 0 else "?", os.uname().machine))
     code, pv = run(["python3", "--version"], timeout=10)
@@ -1001,8 +1002,13 @@ def cmd_uninstall(a):
     return 0
 
 
+def kit_version():
+    return read_text(os.path.join(REPO, "VERSION")).strip() or "未知"
+
+
 def main():
     p = argparse.ArgumentParser(prog=NAME, description="iPhone 助手工具包")
+    p.add_argument("--version", action="version", version="%s %s" % (NAME, kit_version()))
     sub = p.add_subparsers(dest="cmd")
     s = sub.add_parser("init", help="安装向导")
     s.add_argument("--dry-run", action="store_true", help="试运行，不改任何文件")
