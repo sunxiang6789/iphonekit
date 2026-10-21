@@ -147,6 +147,7 @@ DEFAULT_CONFIG = {
     "dsh": {
         "bin": "",
         "profile": "iak",
+        "ack_profile": "iak-ack",
     },
     # 被控手机发来的任务做完后，让它自己运行「手机朗读」快捷指令把回复念出来（默认关）。
     # 需要被控手机装了「手机朗读」，且 iphone-use 允许打开 shortcuts:// 链接（IPHONE_USE_ALLOW_URL_SCHEMES=shortcuts）。
@@ -409,26 +410,43 @@ def to_simplified(text):
     return "".join(_TRAD.get(ch, ch) for ch in text)
 
 
-def generate_ack(cfg, text):
-    """用 Haiku 现编一句和指令相关的「收到」。出错、超时或输出不像样都返回 None，由固定的话兜底。"""
+def _ack_via_dsh(cfg, prompt, env, timeout):
+    """DeepSeek flash（不思考、不带任何工具）：约 1～2 秒。"""
+    profile = (cfg.get("dsh") or {}).get("ack_profile") or "iak-ack"
+    out = subprocess.run([find_dsh(cfg), "--profile", profile, prompt], capture_output=True, text=True,
+                         env=env, stdin=subprocess.DEVNULL, cwd=WORK_DIR, timeout=timeout)
+    if out.returncode != 0:
+        raise RuntimeError("dsh 退出码 %s：%s" % (out.returncode, out.stderr.strip()[-120:]))
+    return out.stdout
+
+
+def _ack_via_claude(cfg, prompt, env, timeout):
+    """Haiku：约 5～8 秒（命令行启动慢），只在 dsh 不可用时兜底。"""
     r = cfg.get("routing") or {}
+    env = dict(env); env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
+    cmd = [find_claude(cfg), "-p", prompt, "--model", r.get("classifier_model", "claude-haiku-5-5"),
+           "--setting-sources", cfg["claude"].get("setting_sources", "project,local"),
+           "--strict-mcp-config", "--tools", "", "--output-format", "json"]
+    out = subprocess.run(cmd, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL,
+                         cwd=WORK_DIR, timeout=timeout)
+    return json.loads(out.stdout).get("result") or ""
+
+
+def generate_ack(cfg, text):
+    """现编一句和指令相关的「收到」：先用 DeepSeek flash（快），不行再用 Haiku；都失败或输出不像样返回 None，由固定的话兜底。"""
     persona = (cfg.get("persona") or {}).get("enabled", True)
+    prompt = (ACK_PROMPT_PERSONA if persona else ACK_PROMPT_PLAIN) + text[:300]
     env = dict(os.environ); env.update(cfg.get("env", {}))
-    env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
-    try:
-        cmd = [find_claude(cfg), "-p", (ACK_PROMPT_PERSONA if persona else ACK_PROMPT_PLAIN) + text[:300],
-               "--model", r.get("classifier_model", "claude-haiku-5-5"),
-               "--setting-sources", cfg["claude"].get("setting_sources", "project,local"),
-               "--strict-mcp-config", "--tools", "", "--output-format", "json"]
-        out = subprocess.run(cmd, capture_output=True, text=True, env=env, stdin=subprocess.DEVNULL,
-                             cwd=WORK_DIR, timeout=float(cfg.get("ack_timeout_secs", 10)))
-        line = (json.loads(out.stdout).get("result") or "").strip().splitlines()
-        line = (line[0] if line else "").strip().strip("\"“”'「」")
-    except Exception as e:
-        log("生成回复语失败，用固定的话：%s" % e)
-        return None
-    line = to_simplified(line)
-    return line if 2 <= len(line) <= 40 else None
+    timeout = float(cfg.get("ack_timeout_secs", 10))
+    for name, fn in (("dsh", _ack_via_dsh), ("claude", _ack_via_claude)):
+        try:
+            lines = fn(cfg, prompt, env, timeout).strip().splitlines()
+            line = to_simplified((lines[0] if lines else "").strip().strip("\"“”'「」"))
+            if 2 <= len(line) <= 40:
+                return line
+        except Exception as e:
+            log("生成回复语（%s）失败：%s" % (name, e))
+    return None
 
 
 def strip_simple_rules(rules, mode):

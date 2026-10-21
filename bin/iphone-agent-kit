@@ -548,6 +548,16 @@ def setup_dsh_profile(dsh_bin, mcp_bin):
     tpl = read_text(find_template("dsh-profile.patch.yml")).replace("{{IPHONE_USE_MCP}}", mcp_bin)
     write_file(os.path.join(prof, "cordis.patch.yml"), tpl, 0o644)
     ok("DeepSeek 专用配置已建好：%s（只给手机工具，已关掉跑命令/读写文件）" % prof)
+    # 「收到」回复语专用的轻量配置：deepseek-flash、不思考、不接任何工具，约 1～2 秒
+    ack = os.path.join(home, "profiles", "iak-ack")
+    os.makedirs(ack, exist_ok=True)
+    for f in ("package.json", "pnpm-workspace.yaml"):
+        if not os.path.exists(os.path.join(ack, f)) and os.path.exists(os.path.join(prof, f)):
+            shutil.copy2(os.path.join(prof, f), os.path.join(ack, f))
+    if not os.path.exists(os.path.join(ack, "cordis.yml")):
+        write_file(os.path.join(ack, "cordis.yml"), "[]\n", 0o644)
+    write_file(os.path.join(ack, "cordis.patch.yml"), read_text(find_template("dsh-ack-profile.patch.yml")), 0o644)
+    ok("回复语专用配置已建好：%s" % ack)
     say("  ⚠️ 还需要 DeepSeek 的 API key：打开 DeepSeek Harness 桌面版 → Models 页面填好（账号登录自动生成的 key 命令行用不了）。")
     return True
 
