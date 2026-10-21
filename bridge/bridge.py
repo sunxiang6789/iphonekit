@@ -11,7 +11,7 @@ config.json（含令牌，权限 600）、tasks.json、logs/、work/。
 
     python3 bridge.py                # 启动服务
     python3 bridge.py --print-token  # 打印令牌
-    python3 bridge.py --check        # 打印自动探测到的 codex / claude / iphone-use-mcp 路径
+    python3 bridge.py --check        # 打印自动探测到的 codex / claude / dsh / iphone-use-mcp 路径
 """
 
 import glob
@@ -44,8 +44,8 @@ SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 # 规则模板：数据目录里的同名文件优先（用户自己改的），其次仓库的 templates/。
 TEMPLATE_DIRS = [DATA_DIR, os.path.join(os.path.dirname(SRC_DIR), "templates"), os.path.join(SRC_DIR, "templates")]
 
-AGENTS = ("codex", "claude")
-AGENT_NAMES = {"codex": "Codex", "claude": "Claude"}
+AGENTS = ("codex", "claude", "dsh")
+AGENT_NAMES = {"codex": "Codex", "claude": "Claude", "dsh": "DeepSeek"}
 CONFIRM_MARK = "【需要确认】"
 
 
@@ -64,7 +64,7 @@ def system_tz():
 DEFAULT_CONFIG = {
     "port": 18800,
     "token": "",
-    # 默认用哪个助手：codex 或 claude（没指定时用它；开头说「用 Codex，……」可以临时换）。
+    # 默认用哪个助手：codex、claude 或 dsh（DeepSeek）（没指定时用它；开头说「用 Codex，……」可以临时换）。
     "default_agent": "claude",
     # 人设：默认开。人设文件见 templates/persona-xiaoyou.md；关掉后回复和提示语都用中性口吻。
     "persona": {"enabled": True, "file": "persona-xiaoyou.md"},
@@ -140,6 +140,12 @@ DEFAULT_CONFIG = {
         # 关掉"先查找工具"：一开始就把 iphone-use 的工具全给它，每个任务省一次约 2 秒的思考。
         "tool_search": False,
         "allowed_tools": "mcp__iphone-use",
+    },
+    # DeepSeek Harness（官方 dsh 命令行）。profile 是专用配置：只挂 iphone-use 的手机工具，
+    # 关掉了跑命令、读写文件、联网等（iphone-agent-kit init 会建好；见 templates/dsh-profile.patch.yml）。
+    "dsh": {
+        "bin": "",
+        "profile": "iak",
     },
     # 被控手机发来的任务做完后，让它自己运行「手机朗读」快捷指令把回复念出来（默认关）。
     # 需要被控手机装了「手机朗读」，且 iphone-use 允许打开 shortcuts:// 链接（IPHONE_USE_ALLOW_URL_SCHEMES=shortcuts）。
@@ -298,6 +304,15 @@ def find_codex(cfg):
                     "请先安装 Codex 命令行，或在 config.json 的 codex.bin 里写完整路径。")
 
 
+def find_dsh(cfg):
+    return _resolve((cfg.get("dsh") or {}).get("bin"), "dsh",
+                    ["/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+                     "~/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh",
+                     "~/.local/bin/dsh", "/opt/homebrew/bin/dsh", "/usr/local/bin/dsh"],
+                    "DeepSeek Harness（dsh）",
+                    "请先安装 DeepSeek Harness 桌面版（官方，自带 dsh 命令行），或在 config.json 的 dsh.bin 里写完整路径。")
+
+
 def find_iphone_use_mcp(cfg):
     return _resolve(cfg.get("iphone_use_mcp"), "iphone-use-mcp",
                     ["~/Applications/iPhoneUse.app/Contents/MacOS/iphone-use-mcp",
@@ -331,13 +346,15 @@ def clean_reply(text):
 
 def parse_agent_prefix(text):
     """「用 Codex，打开设置」→ ("codex", None, "打开设置")；「用 Opus，……」→ ("claude", "think", …)。"""
-    m = re.match(r"^\s*用\s*(codex|claude|克劳德|扣德克斯|opus|欧珀斯|sonnet|索内特)\s*[,，:：。\s]*",
+    m = re.match(r"^\s*用\s*(codex|claude|克劳德|扣德克斯|opus|欧珀斯|sonnet|索内特|deepseek|dsh|深度求索|迪普西克)\s*[,，:：。\s]*",
                  text, re.I)
     if not m:
         return None, None, text
     word = m.group(1).lower()
     if word in ("codex", "扣德克斯"):
         return "codex", None, text[m.end():].strip()
+    if word in ("deepseek", "dsh", "深度求索", "迪普西克"):
+        return "dsh", None, text[m.end():].strip()
     mode = "think" if word in ("opus", "欧珀斯") else "simple" if word in ("sonnet", "索内特") else None
     return "claude", mode, text[m.end():].strip()
 
@@ -551,7 +568,7 @@ class Bridge:
         prefix_agent, mode, text = parse_agent_prefix(text)
         agent = (agent or prefix_agent or self.cfg["default_agent"]).lower()
         if agent not in AGENTS:
-            raise ValueError("不支持的助手：%s（可选 codex / claude）" % agent)
+            raise ValueError("不支持的助手：%s（可选 codex / claude / dsh）" % agent)
         if not text:
             raise ValueError(phrase(self.cfg, "no_talk"))
         resume = None
@@ -713,6 +730,12 @@ class Bridge:
             if task["resume"]:
                 return [codex_bin, "exec", "resume"] + opts + [task["resume"], prompt]
             return [codex_bin, "exec"] + opts + [prompt]
+        if task["agent"] == "dsh":
+            d = self.cfg.get("dsh") or {}
+            cmd = [find_dsh(self.cfg), "--profile", d.get("profile") or "iak", "--json"]
+            if task["resume"]:
+                cmd += ["--session-id", task["resume"]]
+            return cmd + [prompt]
         c = self.cfg["claude"]
         route = (self.cfg.get("routing") or {}).get(task.get("mode") or "", {})
         extra = (route.get("extra_tools") or "").split()
@@ -765,6 +788,8 @@ class Bridge:
         err = err.decode("utf-8", "replace")
         if task["agent"] == "codex":
             self._parse_codex(task, proc.returncode, out, err, out_file)
+        elif task["agent"] == "dsh":
+            self._parse_dsh(task, proc.returncode, out, err)
         else:
             self._parse_claude(task, proc.returncode, out, err)
         try:
@@ -844,6 +869,29 @@ class Bridge:
                 result = f.read().strip()
         task["state"] = "done" if code == 0 and result else "failed"
         task["result"] = result or ("Codex 退出码 %s：%s" % (code, err.strip()[-800:]))
+
+    def _parse_dsh(self, task, code, out, err):
+        """dsh --json：每行一个事件，session 事件带会话号，final 事件是最终回复。"""
+        final, errors = "", []
+        for line in out.splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            kind = ev.get("type")
+            if kind == "session":
+                task["session_id"] = ev.get("sessionId")
+            elif kind == "final":
+                final = (ev.get("text") or "").strip()
+            elif kind == "error":
+                errors.append(json.dumps(ev, ensure_ascii=False)[:300])
+        task["session_id"] = task["session_id"] or task["resume"]
+        if code == 0 and final:
+            task["state"], task["result"] = "done", clean_reply(final)
+        else:
+            tail = "；".join(errors) or err.strip()[-600:]
+            task["state"] = "failed"
+            task["result"] = final or "DeepSeek 退出码 %s：%s" % (code, tail)
 
     def _parse_claude(self, task, code, out, err):
         try:
@@ -993,7 +1041,7 @@ def main():
         print(cfg["token"])
         return
     if "--check" in sys.argv:
-        for name, fn in (("codex", find_codex), ("claude", find_claude), ("iphone_use_mcp", find_iphone_use_mcp)):
+        for name, fn in (("codex", find_codex), ("claude", find_claude), ("dsh", find_dsh), ("iphone_use_mcp", find_iphone_use_mcp)):
             try:
                 print("%s: %s" % (name, fn(cfg)))
             except RuntimeError as e:

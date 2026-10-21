@@ -128,7 +128,7 @@ iphone-agent-kit doctor
 
 小技巧：
 
-- 句子开头说「用 Codex，……」「用 Claude，……」可以临时换助手；用 Claude 时说「用 Opus，……」（要动脑的事）或「用 Sonnet，……」（简单的事）可以指定模型，不说就自动判断。
+- 句子开头说「用 Codex，……」「用 Claude，……」「用 DeepSeek，……」可以临时换助手（DeepSeek 需要先配好，见下面「DeepSeek」）；用 Claude 时说「用 Opus，……」（要动脑的事）或「用 Sonnet，……」（简单的事）可以指定模型，不说就自动判断。
 - 下命令的手机和被控的手机可以是同一台，也可以是两台。
 - 只有一个快捷指令就够了，不需要别的。
 
@@ -137,6 +137,15 @@ iphone-agent-kit doctor
 有些助手有自己的手机 App，可以「远程连」电脑上正在运行的助手。这样你在手机上和它聊天，电脑上的它去操控 iPhone。这种方式**不需要快捷指令和桥接服务**，只需要装好 iphone-use，并让向导把规则写进 `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md`。
 
 各家支持情况见 [docs/方式A-助手手机端.md](docs/方式A-助手手机端.md)（会变，以官方为准）。
+
+## DeepSeek（可选）
+
+电脑上装了 **DeepSeek Harness 桌面版**（官方，自带 `dsh` 命令行）的话，向导会问你要不要也配上 DeepSeek。选「要」后：
+
+- 向导会给 `dsh` 建一个专用配置 `iak`，接上手机工具，并**锁死**它的跑命令、读写文件、联网、子任务等能力（后台无人值守，只允许操作手机）。
+- 你需要有 DeepSeek 的 **API key**：打开桌面版 → Models 页面填好。⚠️ 账号登录后桌面版自动生成的 key，命令行用不了，要自己去 platform.deepseek.com 新建一个。
+- 之后在指令开头说「用 DeepSeek，……」（或「用 dsh，……」）就走它。
+- 命令行版依赖官方的 MCP 插件 `@deepseek-ai/dsh-mcp-client`，向导会自动装；`dsh` 目前是候选版本（0.2.x），更新后如果不好用，重跑 `iphone-agent-kit init`。
 
 ## 命令速查
 

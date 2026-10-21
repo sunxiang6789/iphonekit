@@ -520,6 +520,38 @@ def check_cli(agents, detected):
     return detected
 
 
+def setup_dsh_profile(dsh_bin, mcp_bin):
+    """给 DeepSeek Harness 建专用配置 iak：挂上 iphone-use 的 MCP，并锁死跑命令/读写文件等工具。已存在则重写补丁文件。"""
+    home = os.environ.get("DSH_HOME") or os.path.expanduser("~/.dsh")
+    prof = os.path.join(home, "profiles", "iak")
+    if DRY:
+        say("  [试运行] 会在 %s 建 DeepSeek 专用配置（装 MCP 插件 + 锁死工具）" % prof)
+        return True
+    os.makedirs(prof, exist_ok=True)
+    base = os.path.join(home, "profiles", "headless")
+    for f in ("package.json", "pnpm-workspace.yaml"):
+        dst = os.path.join(prof, f)
+        if not os.path.exists(dst):
+            src = os.path.join(base, f)
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+    if not os.path.exists(os.path.join(prof, "package.json")):
+        write_file(os.path.join(prof, "package.json"), json.dumps({
+            "name": "dsh-profile-iak", "private": True, "dependencies": {},
+            "dsh": {"profile": {"bundles": ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"]}}}, indent=2), 0o644)
+    if not os.path.exists(os.path.join(prof, "cordis.yml")):
+        write_file(os.path.join(prof, "cordis.yml"), "[]\n", 0o644)
+    code, out = run([dsh_bin, "plugin", "--profile", "iak", "add", "@deepseek-ai/dsh-mcp-client@next"], timeout=600)
+    if code != 0:
+        warn("装 DeepSeek 的 MCP 插件没成功：%s" % out[-300:], "检查网络后重跑 iphone-agent-kit init")
+        return False
+    tpl = read_text(find_template("dsh-profile.patch.yml")).replace("{{IPHONE_USE_MCP}}", mcp_bin)
+    write_file(os.path.join(prof, "cordis.patch.yml"), tpl, 0o644)
+    ok("DeepSeek 专用配置已建好：%s（只给手机工具，已关掉跑命令/读写文件）" % prof)
+    say("  ⚠️ 还需要 DeepSeek 的 API key：打开 DeepSeek Harness 桌面版 → Models 页面填好（账号登录自动生成的 key 命令行用不了）。")
+    return True
+
+
 def cmd_init(a):
     global DRY, ASSUME_YES
     DRY, ASSUME_YES = a.dry_run, a.yes
@@ -568,6 +600,11 @@ def cmd_init(a):
 
     if use_b:
         detected = check_cli(agents, detected)
+
+    dsh_on = False
+    if use_b and detected.get("dsh"):
+        say("\n  检测到 DeepSeek Harness（官方 dsh 命令行）。")
+        dsh_on = a.dsh == "on" if a.dsh else confirm("  也配上 DeepSeek 吗？（开头说「用 DeepSeek，……」就走它；需要你有 DeepSeek 的 API key）", False)
 
     # 2 Bark
     step("【3/8】Bark 推送（%s）" % ("必配：快捷指令只回「收到」，做完的结果靠 Bark 推送到手机" if use_b else "方式 A 可选：用来收「要你付款/确认」的提醒"))
@@ -649,6 +686,9 @@ def cmd_init(a):
             apply_block(path, block)
         else:
             warn("跳过 %s" % path, "不写的话，直接和 %s 对话时它不知道付款要先确认等规则" % ag)
+
+    if dsh_on:
+        setup_dsh_profile(detected["dsh"], detected.get("iphone_use_mcp") or "")
 
     # App 笔记
     notes = sorted(f for f in os.listdir(os.path.join(REPO, "app-notes")) if f.endswith(".md")) \
@@ -959,6 +999,7 @@ def main():
     s.add_argument("--yes", action="store_true", help="所有提问用默认值（测试/脚本用）")
     s.add_argument("--mode", choices=["a", "b", "both"], help="用哪种方式：a 助手手机端 / b 快捷指令 / both 都要")
     s.add_argument("--beginner", choices=["on", "off"], help="纯小白模式：助手停下来时要把怎么操作讲清楚")
+    s.add_argument("--dsh", choices=["on", "off"], help="同时配置 DeepSeek Harness（官方 dsh）")
     s.add_argument("--agent", choices=["claude", "codex", "both"])
     s.add_argument("--bark-key")
     s.add_argument("--persona", choices=["on", "off"])

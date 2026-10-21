@@ -1,0 +1,44 @@
+# iphone-agent-kit 专用配置（基于 headless）：只给 iphone-use 的手机工具，关掉终端命令、读写文件、联网、子任务等。
+# iphone-agent-kit: 把 iphone-use 的 MCP 接进来（工具名形如 mcp__iphone-use__xxx）
+- insert:
+    - id: mcp-iphone-use
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: iphone-use
+        transport: stdio
+        command: "{{IPHONE_USE_MCP}}"
+        args: []
+        env:
+          IPHONE_USE_OWNER: !!js process.env.IPHONE_USE_OWNER || 'bridge'
+          TZ: !!js process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone
+        toolCallTimeoutMs: 120000
+
+# 打开本地凭据服务：让命令行能读到在桌面版 Models 页面里存的 API key
+- id: credentials
+  disabled: false
+
+# 锁死：后台无人值守，不能让它跑命令或改文件
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+- id: tool-jobs
+  disabled: true
+- id: tool-fs
+  disabled: true
+- id: tool-fs-search
+  disabled: true
+- id: tool-skill
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-web
+  disabled: true
