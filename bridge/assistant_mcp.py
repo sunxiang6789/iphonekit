@@ -199,6 +199,8 @@ class PhoneClient:
 def wait_for_reply(args):
     """登记等待任务（只调用本机等待器的 add，不发消息、不操作手机）。路径写在数据目录的 waiter.json，不进仓库。"""
     import shlex
+    if os.path.exists(os.path.join(HOME, "waiter.disabled")):
+        raise ValueError("等待功能已临时关闭，不要登记等待任务；消息发出去就直接收尾，告诉用户已经发了。")
     cfg = json.loads(read_text(os.path.join(HOME, "waiter.json")) or "{}")
     waiter, submit = cfg.get("waiter"), cfg.get("submit")
     if not waiter or not os.path.exists(waiter):
