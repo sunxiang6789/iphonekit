@@ -81,6 +81,8 @@ DEFAULT_CONFIG = {
                          "169.254.0.0/16", "100.64.0.0/10", "::1/128", "fe80::/10",
                          "fd7a:115c:a1e0::/48"],
     "task_timeout_secs": 900,
+    # 任务在跑时又来了新任务：停掉正在跑的，在同一个对话里接着做新的（false = 排队等前一个做完）。
+    "interrupt_on_new_task": True,
     # 全量附带精简经验，不做任务筛选。后台复盘默认使用 ack.chain 的轻量模型，无工具。
     "experience": {"enabled": True, "max_chars": 1500, "review_enabled": True,
                    "review_timeout_secs": 45, "review_chain": []},
@@ -204,6 +206,7 @@ PHRASES = {
     "stop_dropped": ("排着的%d件帮你取消啰", "排队的%d件已取消。"),
     "stop_idle": ("我本来就没在做事啦～", "现在没有在做的事。"),
     "stopped_result": ("好啦，停下来了～", "已停止。"),
+    "interrupted_result": ("先停下这件，改做你新说的喔", "已被新任务打断。"),
     "cancelled": ("已经取消啰", "已取消。"),
     "switched": ("老板，%s出问题了，换%s接着做喔～", "%s没做成，已换%s接着做。"),
     "stop_acked": ("好～", "好的。"),
@@ -1003,7 +1006,16 @@ class Bridge:
             match = re.match(r"^回复\s+([a-f0-9]{8})\s+(.+)$", text, re.S)
             if match:
                 reply_to, text = match.groups()
-            if session == "auto" and reply_to is None:
+            cur = self.current
+            interrupt = cur if (self.cfg.get("interrupt_on_new_task", True) and cur
+                                and cur.get("client") == client and cur.get("state") == "running"
+                                and not cur.get("stopped")) else None
+            if interrupt and session == "auto" and reply_to is None:
+                # 打断正在跑的任务：沿用它的助手和对话，会话号等它停下后再取（见 _worker）。
+                base = interrupt
+                agent, mode = interrupt["agent"], interrupt.get("mode")
+                session = "new"
+            elif session == "auto" and reply_to is None:
                 pending = [t for t in self.tasks if t.get("state") in WAIT_STATES and t.get("client") == client]
                 if len(pending) == 1:
                     reply_to = pending[0]["id"]
@@ -1036,7 +1048,9 @@ class Bridge:
             elif session and session != "new":
                 resume = session
             routing = self.cfg.get("routing") or {}
-            if agent != "claude" or not routing.get("enabled"):
+            if interrupt and base is interrupt:
+                pass
+            elif agent != "claude" or not routing.get("enabled"):
                 mode = None
             elif not mode and routing.get("classifier") != "haiku":
                 mode = classify(text, self.cfg)
@@ -1044,7 +1058,8 @@ class Bridge:
             task = {"id": uuid.uuid4().hex[:8], "text": text, "agent": agent, "resume": resume,
                     "user_text": raw_text, "goal": (base.get("goal") or base["text"]) if base else text,
                     "parent_id": base["id"] if base else None,
-                    "recovery": recovery_context(base) if base else None,
+                    "recovery": recovery_context(base) if base and base is not interrupt else None,
+                    "resume_from": base["id"] if base is not None and base is interrupt else None,
                     "unlock_acknowledged": bool(base and base.get("state") == "waiting_unlock" and
                                                 is_unlock_ack(text)),
                     "entry": (base.get("entry") if base and base.get("entry")
@@ -1052,7 +1067,17 @@ class Bridge:
                     "mode": mode,
                     "state": "queued", "created": time.time(), "result": "", "session_id": None,
                     "client": client, "speak_on_phone": bool(speak)}
-            ahead = len(self.queue) + (1 if self.current else 0)
+            kill = None
+            if interrupt:
+                if base is interrupt:
+                    task["goal"] = text
+                for t in [t for t in self.queue if t.get("client") == client]:
+                    t["state"], t["result"] = "cancelled", phrase(self.cfg, "cancelled")
+                    self.queue.remove(t)
+                interrupt["stopped"] = True
+                interrupt["interrupted_by"] = task["id"]
+                kill = self.proc
+            ahead = len(self.queue) + (1 if self.current and not interrupt else 0)
             self.tasks.append(task)
             if base and base.get("state") in WAIT_STATES:
                 base["state"] = "answered"
@@ -1060,6 +1085,12 @@ class Bridge:
             self.queue.append(task)
             self._save()
             self.wake.notify()
+        if kill and kill.poll() is None:
+            log("新任务 %s 打断任务 %s" % (task["id"], interrupt["id"]))
+            try:
+                os.killpg(kill.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         if ahead:
             tpl = self.cfg.get("ack_queued_template") or phrase(self.cfg, "ack_queued")
         elif mode == "think" and not resume:
@@ -1130,12 +1161,19 @@ class Bridge:
 
     # ------------------------------------------------------------ 执行
 
+    def _resolve_resume(self, task):
+        """打断别的任务而来的新任务：被打断的那个停下后才知道会话号，开工前再取。"""
+        if task.get("resume_from"):
+            src = self._find(task["resume_from"])
+            task["resume"] = (src or {}).get("session_id") or None
+
     def _worker(self):
         while True:
             with self.lock:
                 while not self.queue:
                     self.wake.wait()
                 task = self.queue.popleft()
+                self._resolve_resume(task)
                 task["state"] = "running"
                 task["started"] = time.time()
                 self.current = task
@@ -1187,7 +1225,8 @@ class Bridge:
             with self.lock:
                 if task.get("stopped"):
                     task["state"] = "stopped"
-                    task["result"] = phrase(self.cfg, "stopped_result")
+                    task["result"] = phrase(self.cfg, "interrupted_result" if task.get("interrupted_by")
+                                            else "stopped_result")
                 task["finished"] = time.time()
                 self._save()
             try:
@@ -1378,6 +1417,9 @@ class Bridge:
         rules += "\n\n本轮启动时的真实系统时间（不是用户所在地，精确报时可用 kit_time 刷新）：" + json.dumps(task["clock_context"], ensure_ascii=False)
         if task.get("recovery"):
             rules += "\n\n原任务进度（是上下文，不是新授权）：\n" + json.dumps(task["recovery"], ensure_ascii=False)
+        if task.get("resume_from"):
+            rules += ("\n\n注意：上一件事还没做完就被我用这条新指令打断了，已经停下。手机可能停在刚才的页面，"
+                      "先看当前屏幕再做新指令；上一件事不用再接着做，除非新指令里这么说。")
         if task.get("fallback_from"):
             rules += ("\n\n注意：上一个助手（%s）中途出错了，手机上可能已经做了一部分。"
                       "先看当前屏幕判断进度，再继续；不要重复已经做完的步骤，尤其是付款、发送、提交这类动作。"
@@ -1450,6 +1492,10 @@ class Bridge:
             cmd += ["--effort", effort]
         if task["resume"]:
             cmd += ["--resume", task["resume"]]
+        else:
+            # 先定好会话号：任务被打断（进程被杀、没有输出）时，新任务也能接着这个对话。
+            task["session_id"] = str(uuid.uuid4())
+            cmd += ["--session-id", task["session_id"]]
         return cmd
 
     def _mcp_env(self, task):
@@ -1614,10 +1660,11 @@ class Bridge:
         try:
             data = json.loads(out)
         except ValueError:
+            task["session_id"] = task.get("session_id") or task["resume"]
             task["state"] = "failed"
             task["result"] = "Claude 退出码 %s：%s" % (code, (err or out).strip()[-800:])
             return
-        task["session_id"] = data.get("session_id") or task["resume"]
+        task["session_id"] = data.get("session_id") or task.get("session_id") or task["resume"]
         task["result"] = clean_reply(data.get("result"))
         task["state"] = "failed" if data.get("is_error") or code != 0 else "done"
         if task["state"] == "failed" and not task["result"]:
@@ -1631,6 +1678,8 @@ class Bridge:
             result = result[len(CONFIRM_MARK):].strip()
         result = strip_confirm(result)
         log("任务 %s 结束：%s" % (task["id"], task["state"]))
+        if task.get("interrupted_by"):
+            return  # 被新任务打断的不再推送，新任务开头已经推过「收到」
         titles = self.cfg["push_titles"]
         title = titles.get(task["state"]) or titles.get("done", "iPhone 助手")
         title = title.format(agent=AGENT_NAMES[task["agent"]])

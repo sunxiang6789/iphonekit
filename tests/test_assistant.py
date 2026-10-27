@@ -317,6 +317,59 @@ class AssistantTests(unittest.TestCase):
             proc.stdin.close()
             proc.wait(timeout=3)
 
+    def test_new_task_interrupts_running_one_and_resumes_its_session(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        cur = {"id": "aaaaaaaa", "text": "问老婆想吃什么", "goal": "问老婆想吃什么", "agent": "claude",
+               "mode": None, "session_id": None, "state": "running", "client": "phone", "result": "",
+               "entry": {"agent": "claude", "model": "claude-sonnet-5-5", "effort": "medium"}}
+        queued = {"id": "bbbbbbbb", "text": "旧的排队任务", "state": "queued", "client": "phone"}
+        self.br.tasks += [cur, queued]
+        self.br.queue.append(queued)
+        self.br.current, self.br.proc = cur, proc
+        res = self.br.submit("算了改成查明天天气", client="phone")
+        proc.wait(timeout=5)
+        new = self.br._find(res["id"])
+        self.assertEqual(res["ahead"], 0)
+        self.assertTrue(cur["stopped"])
+        self.assertEqual(cur["interrupted_by"], new["id"])
+        self.assertEqual(queued["state"], "cancelled")
+        self.assertEqual(list(self.br.queue), [new])
+        self.assertEqual((new["agent"], new["resume_from"], new["resume"]), ("claude", "aaaaaaaa", None))
+        self.assertEqual(new["entry"]["model"], "claude-sonnet-5-5")
+        # 被打断的任务停下后有了会话号，新任务开工前接上它。
+        cur["session_id"] = "sess-1"
+        self.br._resolve_resume(new)
+        self.assertEqual(new["resume"], "sess-1")
+        self.assertIn("被我用这条新指令打断", self.br._prompt(new))
+
+    def test_interrupt_can_be_turned_off_and_ignores_other_clients(self):
+        cur = {"id": "aaaaaaaa", "text": "x", "agent": "claude", "state": "running", "client": "phone",
+               "session_id": "s", "entry": {"agent": "claude"}}
+        self.br.tasks.append(cur)
+        self.br.current = cur
+        res = self.br.submit("查天气", client="mac")
+        self.assertFalse(cur.get("stopped"))
+        self.assertEqual(res["ahead"], 1)
+        self.cfg["interrupt_on_new_task"] = False
+        res = self.br.submit("查天气", client="phone")
+        self.assertFalse(cur.get("stopped"))
+        self.assertEqual(res["ahead"], 2)
+
+    def test_claude_gets_fixed_session_id_so_killed_run_can_resume(self):
+        task = {"id": "cccccccc", "text": "x", "agent": "claude", "resume": None, "session_id": None,
+                "entry": {"agent": "claude"}, "mode": None}
+        with patch.object(b, "find_claude", return_value="claude"), patch.object(b, "find_iphone_use_mcp", return_value=""):
+            cmd = self.br._command(task, "out")
+            self.assertEqual(cmd[cmd.index("--session-id") + 1], task["session_id"])
+            self.br._parse_claude(task, -15, "", "")
+            self.assertEqual(task["state"], "failed")
+            self.assertTrue(task["session_id"])
+            task.update(resume=task["session_id"])
+            cmd = self.br._command(task, "out")
+            self.assertNotIn("--session-id", cmd)
+            self.assertIn("--resume", cmd)
+
 
 if __name__ == "__main__":
     unittest.main()
