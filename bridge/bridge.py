@@ -168,6 +168,7 @@ DEFAULT_CONFIG = {
     # agent 留空 = 用上面的 default_agent；model/effort 留空 = 用该助手自己的默认。
     #   claude 的 model 例：claude-sonnet-5-5；codex 的 model 例：gpt-6.1-sol；
     #   dsh 的 model 写“服务商/模型”，例：inception/mercury-3、deepseek-official/deepseek-flash（effort 可选 off/low/high/max）。
+    #   注意：水星 3 没有视觉识别（看不了截图），要看屏幕内容（如微信聊天回复）的任务用 claude。
     "task": {
         "agent": "",
         "model": "",
